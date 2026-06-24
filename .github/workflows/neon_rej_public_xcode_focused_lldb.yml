@@ -1,0 +1,276 @@
+name: NEON rejection sampler public Xcode focused lldb
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  focused-lldb:
+    name: focused Xcode 15.0.1 lldb (${{ matrix.case_id }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_id: b9fa21c6-pk-validation
+            commit: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            bin_glob: libcrux_ml_kem-*
+            test_filter: mlkem768::tests::pk_validation
+          - case_id: 0c67a85b-kat1024
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            bin_glob: nistkats-*
+            test_filter: kyber1024_nist_known_answer_tests
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.commit }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Focused Xcode 15.0.1 lldb probe
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/focused-${{ matrix.case_id }}/xcode-15.0.1-focused-lldb"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+
+          {
+            echo "# Xcode 15.0.1 focused lldb"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Case: \`${{ matrix.case_id }}\`"
+            echo "Binary glob: \`${{ matrix.bin_glob }}\`"
+            echo "Test filter: \`${{ matrix.test_filter }}\`"
+            echo "Selected developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" cc --version || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Xcode 15.0.1 developer dir is absent; cannot run focused probe." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          run_with_timeout() {
+            local seconds="$1"
+            local log="$2"
+            shift 2
+            "$@" > "$log" 2>&1 &
+            local pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "TIMEOUT after ${seconds}s: $*" >> "$log"
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 5
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            ) &
+            local watchdog=$!
+            wait "$pid"
+            local status=$?
+            kill "$watchdog" 2>/dev/null || true
+            wait "$watchdog" 2>/dev/null || true
+            return "$status"
+          }
+
+          find_test_binary() {
+            local pattern="$1"
+            local candidate
+            for candidate in target/release/deps/${pattern}; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          record_binary_metadata() {
+            local bin="$1"
+            local label="$2"
+            {
+              echo "### ${label} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin" || true
+              otool -hv "$bin" || true
+              otool -l "$bin" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              codesign -dv --verbose=4 "$bin" || true
+              nm -nm "$bin" 2>/dev/null | grep -E 'generate_keypair|rej_sample|sample_matrix|deserialize' || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+          }
+
+          run_lldb() {
+            local bin_abs="$1"
+            local label="$2"
+            local log="$out_dir/${label}.lldb.log"
+            pushd libcrux-ml-kem >/dev/null
+            run_with_timeout 120 "$log" lldb --batch \
+              -o "settings set -- target.run-args ${{ matrix.test_filter }} --exact --nocapture --test-threads=1" \
+              -o "run" \
+              -k "thread backtrace all" \
+              -k "register read" \
+              -k "disassemble --pc" \
+              -k 'image lookup -a $pc' \
+              -k 'image lookup -s libcrux_ml_kem::ind_cpa::generate_keypair' \
+              -k 'image lookup -s libcrux_ml_kem::ind_cpa::sample_matrix_A' \
+              -k 'image lookup -s libcrux_polynomials_aarch64' \
+              -- "$bin_abs"
+            local status=$?
+            popd >/dev/null
+            echo "$status"
+          }
+
+          build_and_probe_mode() {
+            local mode="$1"
+            local build_log="$out_dir/${mode}.build-no-run.log"
+            local run_log="$out_dir/${mode}.direct.log"
+            local list_log="$out_dir/${mode}.list.log"
+            local bin bin_abs build_status list_status run_status lldb_status
+
+            {
+              echo
+              echo "## Mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            fi
+            popd >/dev/null
+
+            {
+              echo "- build no-run exit: \`${build_status}\`"
+              echo "- rustc simd128 cfg lines: \`$(grep -c -- \"--cfg 'feature=\\\"simd128\\\"'\" "$build_log" || true)\`"
+              echo "- compiler error lines: \`$(grep -Eic '(^error:|ld:|clang:)' "$build_log" || true)\`"
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              return
+            fi
+
+            bin="$(find_test_binary "${{ matrix.bin_glob }}")"
+            bin_abs="$PWD/$bin"
+            pushd libcrux-ml-kem >/dev/null
+            "$bin_abs" --list > "$list_log" 2>&1
+            list_status=$?
+            run_with_timeout 90 "$run_log" "$bin_abs" "${{ matrix.test_filter }}" --exact --nocapture --test-threads=1
+            run_status=$?
+            popd >/dev/null
+
+            lldb_status="skipped"
+            if [ "$run_status" -eq 132 ] || [ "$run_status" -eq 139 ]; then
+              lldb_status="$(run_lldb "$bin_abs" "$mode")"
+            fi
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo "- list_exit: \`${list_status}\`"
+              echo "- direct_exit: \`${run_status}\`"
+              echo "- lldb_exit: \`${lldb_status}\`"
+              echo "- direct test result lines: \`$(grep -c 'test result:' "$run_log" || true)\`"
+              echo "- first signal: \`$(grep -Eim1 'signal:|SIGSEGV|SIGILL|EXC_BAD|stop reason|Illegal instruction|Segmentation fault' "$run_log" "$out_dir/${mode}.lldb.log" 2>/dev/null || true)\`"
+              echo
+            } >> "$summary"
+
+            record_binary_metadata "$bin_abs" "$mode"
+          }
+
+          build_and_probe_mode ordinary
+          build_and_probe_mode plus-neon
+
+          cat "$summary"
+          true
+
+      - name: Upload focused lldb diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-focused-lldb-${{ matrix.case_id }}
+          path: neon-rej-diagnostics/focused-${{ matrix.case_id }}/xcode-15.0.1-focused-lldb
+          if-no-files-found: error
