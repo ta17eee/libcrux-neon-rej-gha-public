@@ -201,7 +201,7 @@ jobs:
             local label="$2"
             local log="$out_dir/${label}.lldb.log"
             run_with_timeout 120 "$log" lldb --batch \
-              -o "settings set target.run-args --nocapture --test-threads=1" \
+              -o "settings set -- target.run-args --nocapture --test-threads=1" \
               -o "run" \
               -o "thread backtrace all" \
               -o "register read" \
