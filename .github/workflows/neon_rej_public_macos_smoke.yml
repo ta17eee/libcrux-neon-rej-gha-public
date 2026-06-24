@@ -1,0 +1,74 @@
+name: NEON rejection sampler public macOS smoke
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  macos-14-smoke:
+    name: public macos-14 runner startup smoke
+    runs-on: macos-14
+    steps:
+      - name: Capture runner details
+        run: |
+          mkdir -p neon-rej-smoke
+          {
+            echo "# Public macOS runner smoke"
+            echo
+            echo "## GitHub environment"
+            echo
+            echo "- RUNNER_ARCH=${RUNNER_ARCH:-unset}"
+            echo "- RUNNER_OS=${RUNNER_OS:-unset}"
+            echo "- ImageOS=${ImageOS:-unset}"
+            echo "- ImageVersion=${ImageVersion:-unset}"
+            echo "- ImageVersionOverride=${ImageVersionOverride:-unset}"
+            echo "- GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-unset}"
+            echo "- GITHUB_RUN_ID=${GITHUB_RUN_ID:-unset}"
+            echo
+            echo "## sw_vers"
+            echo
+            sw_vers
+            echo
+            echo "## uname"
+            echo
+            uname -a
+            echo
+            echo "## arch"
+            echo
+            uname -m
+            echo
+            echo "## Xcode"
+            echo
+            xcodebuild -version || true
+            xcode-select -p || true
+            ls -1d /Applications/Xcode*.app 2>/dev/null || true
+            echo
+            echo "## Rust"
+            echo
+            rustc --version || true
+            cargo --version || true
+            rustup --version || true
+            echo
+            echo "## AdvSIMD sysctl probes"
+            echo
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            echo
+            echo "## selected hw.optional keys"
+            echo
+            sysctl -a | grep -E 'hw.optional|hw.machine|hw.model|hw.memsize|machdep.cpu' || true
+          } | tee neon-rej-smoke/runner-smoke.md
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-macos-runner-smoke
+          path: neon-rej-smoke
+          if-no-files-found: error
