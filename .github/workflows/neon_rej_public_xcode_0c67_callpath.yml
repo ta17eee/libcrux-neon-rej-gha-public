@@ -176,16 +176,26 @@ jobs:
                 set -- $line
                 printf 'breakpoint set --address 0x%s\n' "$1"
               done < "$nm_file"
-              printf 'breakpoint set --address %s\n' "$h8997_fault_addr"
+              printf 'breakpoint set --address %s --one-shot true\n' "$h8997_fault_addr"
               printf '%s\n' 'breakpoint list'
               while IFS= read -r line; do
                 [ -n "$line" ] || continue
-                printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'thread backtrace -c 8' -o 'continue'"
+                printf "%s\n" "breakpoint command add ${index} -o 'continue'"
                 index=$((index + 1))
               done < "$nm_file"
-              printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'memory read --format x --size 8 --count 16 \$sp+184' -o 'disassemble --start-address ${h8997_window_addr} --count 48' -o 'breakpoint disable ${index}' -o 'continue'"
               printf '%s\n' 'continue'
+              printf '%s\n' 'script print("=== first stop after initial continue ===")'
               printf '%s\n' 'process status'
+              printf '%s\n' 'breakpoint list'
+              printf '%s\n' 'thread backtrace all'
+              printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
+              printf '%s\n' 'memory read --format x --size 8 --count 16 $sp+184'
+              printf "%s\n" "disassemble --start-address ${h8997_window_addr} --count 48"
+              printf '%s\n' 'image lookup -a $pc'
+              printf '%s\n' 'continue'
+              printf '%s\n' 'script print("=== final state after continuing past one-shot breakpoint ===")'
+              printf '%s\n' 'process status'
+              printf '%s\n' 'breakpoint list'
               printf '%s\n' 'thread backtrace all'
               printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
               printf '%s\n' 'memory read --format x --size 8 --count 16 $sp+184'
