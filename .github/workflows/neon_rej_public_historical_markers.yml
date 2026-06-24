@@ -1,0 +1,301 @@
+name: NEON rejection sampler public historical markers
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  historical-markers:
+    name: historical marker probe (${{ matrix.commit_short }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - commit_short: 0c67a85b
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+          - commit_short: 76ab582c
+            commit: 76ab582c79998d5ef77e6e6b6d287c6b1ff0106d
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.commit }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          sysctl -a | grep -E 'hw.optional|hw.machine|hw.model|hw.memsize|machdep.cpu' || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchains
+        id: install_toolchains
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Historical native runtime sampler marker probe
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchains.outcome == 'success' }}
+        run: |
+          set +e
+          out_dir="$PWD/neon-rej-diagnostics/historical-${{ matrix.commit_short }}/runtime-marker-native"
+          probe_worktree="/tmp/neon-rej-runtime-marker-${{ matrix.commit_short }}"
+          rm -rf "$probe_worktree" "$out_dir"
+          mkdir -p "$probe_worktree" "$out_dir"
+          summary="$out_dir/summary.md"
+
+          {
+            echo "# Historical native runtime sampler marker probe"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Mode: native historical platform detection"
+            echo "Test filter: \`kyber512_nist_known_answer_tests\`"
+            echo
+            echo "## Runner feature keys"
+            echo
+            echo "\`\`\`text"
+            sysctl hw.optional.AdvSIMD
+            echo "status hw.optional.AdvSIMD: $?"
+            sysctl hw.optional.arm.AdvSIMD
+            echo "status hw.optional.arm.AdvSIMD: $?"
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          rsync -a --exclude .git --exclude target ./ "$probe_worktree"/ \
+            >> "$summary" 2>&1
+          rsync_status=$?
+          echo "rsync status: ${rsync_status}" >> "$summary"
+
+          target_file="${probe_worktree}/polynomials-aarch64/src/lib.rs"
+          if [ "${rsync_status}" -eq 0 ] && grep -q 'rejsample::rej_sample(a, out)' "$target_file"; then
+            ruby -0pi -e '
+              old = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        rejsample::rej_sample(a, out)\n    }\n"
+              new = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        static NEON_REJ_SAMPLE_CALLS: std::sync::atomic::AtomicUsize =\n            std::sync::atomic::AtomicUsize::new(0);\n        let call = NEON_REJ_SAMPLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;\n        if call <= 16 || call.is_power_of_two() {\n            eprintln!(\"NEON_REJ_SAMPLE_CALLED call={call} input_len={} output_len={}\", a.len(), out.len());\n        }\n        rejsample::rej_sample(a, out)\n    }\n"
+              raise "target block not found" unless $_.include?(old)
+              $_ = $_.sub(old, new)
+            ' "$target_file" >> "$summary" 2>&1
+            patch_status=$?
+          else
+            echo "native NEON wrapper block absent; likely portable fallback commit" >> "$summary"
+            patch_status=0
+          fi
+          echo "sampler marker patch status: ${patch_status}" >> "$summary"
+
+          platform_file="${probe_worktree}/sys/platform/src/lib.rs"
+          if [ "${patch_status}" -eq 0 ] && [ -f "$platform_file" ]; then
+            ruby -0pi -e '
+              $_ = $_.sub("#[cfg(test)]\n#[macro_use]\nextern crate std;", "#[macro_use]\nextern crate std;")
+              old = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            use macos_arm::*;\n            adv_simd()\n        }\n"
+              new = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            use macos_arm::*;\n            let result = adv_simd();\n            eprintln!(\"DISPATCH_DECISION simd128_support cfg_simd128={} target_aarch64={} result={}\", cfg!(feature = \"simd128\"), cfg!(target_arch = \"aarch64\"), result);\n            result\n        }\n"
+              raise "simd128 macos block not found" unless $_.include?(old)
+              $_ = $_.sub(old, new)
+            ' "$platform_file" >> "$summary" 2>&1
+            dispatch_patch_status=$?
+          else
+            dispatch_patch_status=1
+          fi
+          echo "dispatch marker patch status: ${dispatch_patch_status}" >> "$summary"
+
+          if [ "${dispatch_patch_status}" -eq 0 ]; then
+            {
+              echo
+              echo "## Toolchains"
+              echo
+              echo "\`\`\`text"
+              rustc +1.78.0 --version
+              cargo +1.78.0 --version
+              echo "\`\`\`"
+            } >> "$summary" 2>&1
+
+            pushd "${probe_worktree}/libcrux-ml-kem" >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            cargo +1.78.0 test --verbose --release kyber512_nist_known_answer_tests -- --nocapture \
+              > "$out_dir/ordinary.log" 2>&1
+            ordinary_status=$?
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            RUSTFLAGS="-C target_feature=+neon" \
+              cargo +1.78.0 test --verbose --release kyber512_nist_known_answer_tests -- --nocapture \
+              > "$out_dir/plus-neon.log" 2>&1
+            plus_neon_status=$?
+            popd >/dev/null
+
+            {
+              echo
+              echo "## NEON sampler calls"
+              for log in ordinary plus-neon; do
+                status_var="${log//-/_}_status"
+                count="$(grep -c "NEON_REJ_SAMPLE_CALLED" "$out_dir/${log}.log" || true)"
+                first="$(grep -m1 "NEON_REJ_SAMPLE_CALLED" "$out_dir/${log}.log" || true)"
+                last="$(grep "NEON_REJ_SAMPLE_CALLED" "$out_dir/${log}.log" | tail -n 1 || true)"
+                cfg_count="$(grep -c -- "--cfg 'feature=\"simd128\"'" "$out_dir/${log}.log" || true)"
+                echo "- \`${log}\`: exit=${!status_var}, marker lines=${count}, rustc simd128 cfg lines=${cfg_count}"
+                echo "  first: \`${first:-none}\`"
+                echo "  last: \`${last:-none}\`"
+              done
+              echo
+              echo "## Runtime dispatch decisions"
+              for log in ordinary plus-neon; do
+                count="$(grep -c "DISPATCH_DECISION simd128_support" "$out_dir/${log}.log" || true)"
+                true_count="$(grep -c "DISPATCH_DECISION simd128_support.*result=true" "$out_dir/${log}.log" || true)"
+                false_count="$(grep -c "DISPATCH_DECISION simd128_support.*result=false" "$out_dir/${log}.log" || true)"
+                first="$(grep -m1 "DISPATCH_DECISION simd128_support" "$out_dir/${log}.log" || true)"
+                last="$(grep "DISPATCH_DECISION simd128_support" "$out_dir/${log}.log" | tail -n 1 || true)"
+                echo "- \`${log}\`: marker lines=${count}, result=true lines=${true_count}, result=false lines=${false_count}"
+                echo "  first: \`${first:-none}\`"
+                echo "  last: \`${last:-none}\`"
+              done
+            } >> "$summary" 2>&1
+          fi
+
+          cat "$summary"
+          true
+
+      - name: Historical forced backend fallback marker probe
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchains.outcome == 'success' }}
+        run: |
+          set +e
+          out_dir="$PWD/neon-rej-diagnostics/historical-${{ matrix.commit_short }}/backend-fallback-marker"
+          probe_worktree="/tmp/neon-rej-backend-fallback-marker-${{ matrix.commit_short }}"
+          rm -rf "$probe_worktree" "$out_dir"
+          mkdir -p "$probe_worktree" "$out_dir"
+          summary="$out_dir/summary.md"
+
+          {
+            echo "# Historical forced backend fallback marker probe"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Mode: forced historical macOS \`simd128_support()\` true"
+            echo "Test filter: \`kyber512_nist_known_answer_tests\`"
+            echo
+          } > "$summary" 2>&1
+
+          rsync -a --exclude .git --exclude target ./ "$probe_worktree"/ \
+            >> "$summary" 2>&1
+          rsync_status=$?
+          echo "rsync status: ${rsync_status}" >> "$summary"
+
+          if [ "${rsync_status}" -eq 0 ]; then
+            ruby -0pi -e '
+              old = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            use macos_arm::*;\n            adv_simd()\n        }\n"
+              new = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            true\n        }\n"
+              raise "simd128_support macOS block not found" unless $_.include?(old)
+              $_ = $_.sub(old, new)
+            ' "${probe_worktree}/sys/platform/src/lib.rs" >> "$summary" 2>&1
+            platform_patch_status=$?
+          else
+            platform_patch_status=1
+          fi
+          echo "platform force patch status: ${platform_patch_status}" >> "$summary"
+
+          if [ "${platform_patch_status}" -eq 0 ]; then
+            ruby -0pi -e '
+              pre_old = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        rejsample::rej_sample(a, out)\n    }\n"
+              pre_new = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        static AARCH64_REJ_BACKEND_CALLS: std::sync::atomic::AtomicUsize =\n            std::sync::atomic::AtomicUsize::new(0);\n        let call = AARCH64_REJ_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;\n        if call <= 16 || call.is_power_of_two() {\n            eprintln!(\"AARCH64_REJ_BACKEND kind=neon call={call} input_len={} output_len={}\", a.len(), out.len());\n        }\n        rejsample::rej_sample(a, out)\n    }\n"
+              fallback_old = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        // FIXME: The code in rejsample fails on the CI machines.\n        // We need to understand why and fix it before using it.\n        // We use the portable version in the meantime.\n        rej_sample(a, out)\n    }\n"
+              fallback_new = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        // FIXME: The code in rejsample fails on the CI machines.\n        // We need to understand why and fix it before using it.\n        // We use the portable version in the meantime.\n        static AARCH64_REJ_BACKEND_CALLS: std::sync::atomic::AtomicUsize =\n            std::sync::atomic::AtomicUsize::new(0);\n        let call = AARCH64_REJ_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;\n        if call <= 16 || call.is_power_of_two() {\n            eprintln!(\"AARCH64_REJ_BACKEND kind=portable-fallback call={call} input_len={} output_len={}\", a.len(), out.len());\n        }\n        rej_sample(a, out)\n    }\n"
+              if $_.include?(pre_old)
+                $_ = $_.sub(pre_old, pre_new)
+              elsif $_.include?(fallback_old)
+                $_ = $_.sub(fallback_old, fallback_new)
+              else
+                raise "backend rej_sample wrapper block not found"
+              end
+            ' "${probe_worktree}/polynomials-aarch64/src/lib.rs" >> "$summary" 2>&1
+            backend_patch_status=$?
+          else
+            backend_patch_status=1
+          fi
+          echo "backend marker patch status: ${backend_patch_status}" >> "$summary"
+
+          if [ "${backend_patch_status}" -eq 0 ]; then
+            {
+              echo
+              echo "## Toolchains"
+              echo
+              echo "\`\`\`text"
+              rustc +1.78.0 --version
+              cargo +1.78.0 --version
+              echo "\`\`\`"
+            } >> "$summary" 2>&1
+
+            pushd "${probe_worktree}/libcrux-ml-kem" >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            cargo +1.78.0 test --verbose --release kyber512_nist_known_answer_tests -- --nocapture \
+              > "$out_dir/ordinary.log" 2>&1
+            ordinary_status=$?
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            RUSTFLAGS="-C target_feature=+neon" \
+              cargo +1.78.0 test --verbose --release kyber512_nist_known_answer_tests -- --nocapture \
+              > "$out_dir/plus-neon.log" 2>&1
+            plus_neon_status=$?
+            popd >/dev/null
+
+            {
+              echo
+              echo "## AArch64 backend markers"
+              for log in ordinary plus-neon; do
+                status_var="${log//-/_}_status"
+                neon_count="$(grep -c "AARCH64_REJ_BACKEND kind=neon" "$out_dir/${log}.log" || true)"
+                fallback_count="$(grep -c "AARCH64_REJ_BACKEND kind=portable-fallback" "$out_dir/${log}.log" || true)"
+                first="$(grep -m1 "AARCH64_REJ_BACKEND" "$out_dir/${log}.log" || true)"
+                last="$(grep "AARCH64_REJ_BACKEND" "$out_dir/${log}.log" | tail -n 1 || true)"
+                cfg_count="$(grep -c -- "--cfg 'feature=\"simd128\"'" "$out_dir/${log}.log" || true)"
+                echo "- \`${log}\`: exit=${!status_var}, neon marker lines=${neon_count}, fallback marker lines=${fallback_count}, rustc simd128 cfg lines=${cfg_count}"
+                echo "  first: \`${first:-none}\`"
+                echo "  last: \`${last:-none}\`"
+              done
+            } >> "$summary" 2>&1
+          fi
+
+          cat "$summary"
+          true
+
+      - name: Upload historical marker diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-historical-${{ matrix.commit_short }}-markers
+          path: neon-rej-diagnostics/historical-${{ matrix.commit_short }}
+          if-no-files-found: error
