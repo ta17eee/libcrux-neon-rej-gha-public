@@ -1,0 +1,333 @@
+name: NEON rejection sampler public Xcode disassembly
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  disassembly:
+    name: Xcode 15.0.1 disassembly (${{ matrix.case_id }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_id: b9fa21c6-pk-validation
+            commit: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            bin_glob: libcrux_ml_kem-*
+            test_filter: mlkem768::tests::pk_validation
+          - case_id: 0c67a85b-kat1024
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            bin_glob: nistkats-*
+            test_filter: kyber1024_nist_known_answer_tests
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.commit }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Collect selected-Xcode disassembly
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/disassembly-${{ matrix.case_id }}/xcode-15.0.1-disassembly"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+
+          {
+            echo "# Xcode 15.0.1 disassembly"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Case: \`${{ matrix.case_id }}\`"
+            echo "Binary glob: \`${{ matrix.bin_glob }}\`"
+            echo "Focused test filter: \`${{ matrix.test_filter }}\`"
+            echo "Selected developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objdump || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" cc --version || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Xcode 15.0.1 developer dir is absent; cannot collect disassembly." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          find_test_binary() {
+            local pattern="$1"
+            local candidate
+            for candidate in target/release/deps/${pattern}; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          emit_lldb_lookup() {
+            local bin_abs="$1"
+            local mode="$2"
+            local log="$out_dir/${mode}.lldb-symbols.log"
+            lldb --batch \
+              -o "target create ${bin_abs}" \
+              -o "image lookup -rn generate_keypair" \
+              -o "image lookup -rn rej_sample" \
+              -o "image lookup -rn sample_matrix" \
+              -o "image lookup -rn serialize_public_key" \
+              -o "image lookup -rn serialize_secret_key" \
+              -o "image lookup -a 0x10002ff30" \
+              -o "image lookup -a 0x10002f8dc" \
+              -- > "$log" 2>&1
+          }
+
+          extract_disassembly() {
+            local bin_abs="$1"
+            local mode="$2"
+            local nm_file="$out_dir/${mode}.nm-nm.txt"
+            local objdump_all="$out_dir/${mode}.objdump-symbols.txt"
+            local objdump_ranges="$out_dir/${mode}.objdump-ranges.txt"
+            local objdump_focus="$out_dir/${mode}.objdump-focus.txt"
+            local symbol_list="$out_dir/${mode}.symbols.txt"
+            local ranges_file="$out_dir/${mode}.ranges.tsv"
+
+            nm -nm "$bin_abs" > "$nm_file" 2>&1
+            nm -m "$bin_abs" > "$out_dir/${mode}.nm-m.txt" 2>&1
+
+            grep -E 'generate_keypair|rej_sample|sample_matrix|serialize_public_key|serialize_secret_key|ind_cpa' "$nm_file" \
+              > "$symbol_list" 2>&1 || true
+
+            {
+              echo "## ${mode} selected symbols"
+              echo
+              echo "\`\`\`text"
+              cat "$symbol_list"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --version \
+              > "$out_dir/${mode}.llvm-objdump-version.txt" 2>&1
+
+            while IFS= read -r symbol; do
+              [ -n "$symbol" ] || continue
+              {
+                echo
+                echo "================================================================================"
+                echo "symbol: ${symbol}"
+                echo "================================================================================"
+                DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+                  --macho \
+                  --arch=arm64 \
+                  --demangle \
+                  --no-show-raw-insn \
+                  --disassemble-symbols="${symbol}" \
+                  "$bin_abs" 2>&1
+              } >> "$objdump_all"
+            done < <(
+              awk '/ T / || / t / || / external .*__TEXT,__text/ || / non-external .*__TEXT,__text/ {print $NF}' "$nm_file" \
+                | grep -E 'generate_keypair|rej_sample|sample_matrix|serialize_public_key|serialize_secret_key' \
+                | sort -u
+            )
+
+            awk '
+              /^[0-9a-fA-F]/ && (/ T / || / t / || /__TEXT,__text/) {
+                n += 1
+                addr[n] = $1
+                label = $0
+                sub(/^[0-9a-fA-F]+[[:space:]]+/, "", label)
+                labels[n] = label
+              }
+              END {
+                for (i = 1; i <= n; i++) {
+                  if (labels[i] !~ /generate_keypair|rej_sample|sample_matrix|serialize_public_key|serialize_secret_key/) {
+                    continue
+                  }
+                  for (j = i + 1; j <= n; j++) {
+                    if (addr[j] != addr[i]) {
+                      print "0x" addr[i] "\t0x" addr[j] "\t" labels[i]
+                      break
+                    }
+                  }
+                }
+              }
+            ' "$nm_file" > "$ranges_file"
+
+            while IFS=$'\t' read -r start_address stop_address label; do
+              [ -n "$start_address" ] || continue
+              {
+                echo
+                echo "================================================================================"
+                echo "range: ${start_address}..${stop_address}"
+                echo "label: ${label}"
+                echo "================================================================================"
+                DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+                  --macho \
+                  --arch=arm64 \
+                  --demangle \
+                  --no-show-raw-insn \
+                  --disassemble \
+                  --start-address="${start_address}" \
+                  --stop-address="${stop_address}" \
+                  "$bin_abs" 2>&1
+              } >> "$objdump_ranges"
+            done < "$ranges_file"
+
+            {
+              echo "## ${mode} selected ranges"
+              echo
+              echo "\`\`\`text"
+              cat "$ranges_file"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            if [ -s "$objdump_all" ] || [ -s "$objdump_ranges" ]; then
+              grep -n -E -C 24 'stp[[:space:]]+q1, q0, \[x8\]|generate_keypair|rej_sample|sample_matrix|serialize_public_key|serialize_secret_key|ret|blr|br[[:space:]]' "$objdump_all" "$objdump_ranges" \
+                > "$objdump_focus" 2>&1 || true
+            else
+              echo "No targeted symbol disassembly was produced." > "$objdump_focus"
+            fi
+          }
+
+          build_and_collect_mode() {
+            local mode="$1"
+            local build_log="$out_dir/${mode}.build-no-run.log"
+            local bin bin_abs build_status
+
+            {
+              echo
+              echo "## Mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            fi
+            popd >/dev/null
+
+            {
+              echo "- build no-run exit: \`${build_status}\`"
+              echo "- rustc simd128 cfg lines: \`$(grep -c -- \"--cfg 'feature=\\\"simd128\\\"'\" "$build_log" || true)\`"
+              echo "- compiler/linker diagnostic lines: \`$(grep -Eic '(^error:|ld:|clang:)' "$build_log" || true)\`"
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              return
+            fi
+
+            bin="$(find_test_binary "${{ matrix.bin_glob }}")"
+            bin_abs="$PWD/$bin"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              otool -hv "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              codesign -dv --verbose=4 "$bin_abs" || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+
+            extract_disassembly "$bin_abs" "$mode"
+            emit_lldb_lookup "$bin_abs" "$mode"
+          }
+
+          build_and_collect_mode ordinary
+          build_and_collect_mode plus-neon
+
+          cat "$summary"
+          true
+
+      - name: Upload disassembly diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-disassembly-${{ matrix.case_id }}
+          path: neon-rej-diagnostics/disassembly-${{ matrix.case_id }}/xcode-15.0.1-disassembly
+          if-no-files-found: error
