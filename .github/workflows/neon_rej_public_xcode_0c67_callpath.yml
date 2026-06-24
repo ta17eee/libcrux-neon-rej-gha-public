@@ -165,6 +165,7 @@ jobs:
               printf '%s\n' 'settings set -- target.run-args kyber1024_nist_known_answer_tests --exact --nocapture --test-threads=1'
               printf '%s\n' 'settings set stop-disassembly-display never'
               printf '%s\n' 'image lookup -rn generate_keypair'
+              printf '%s\n' 'process launch --stop-at-entry'
               while IFS= read -r line; do
                 set -- $line
                 printf 'breakpoint set --address 0x%s\n' "$1"
@@ -175,7 +176,7 @@ jobs:
                 printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'thread backtrace -c 8' -o 'continue'"
                 index=$((index + 1))
               done < "$nm_file"
-              printf '%s\n' 'run'
+              printf '%s\n' 'continue'
               printf '%s\n' 'thread backtrace all'
               printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
               printf '%s\n' 'disassemble --pc --count 20'
