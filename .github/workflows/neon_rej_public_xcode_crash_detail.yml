@@ -213,22 +213,28 @@ jobs:
           run_binary() {
             local bin="$1"
             local label="$2"
+            local bin_abs="$PWD/$bin"
             local list_log="$out_dir/${label}.list.log"
             local run_log="$out_dir/${label}.direct.log"
             local status
             local lldb_status="skipped"
 
-            "$bin" --list > "$list_log" 2>&1
+            pushd libcrux-ml-kem >/dev/null
+            "$bin_abs" --list > "$list_log" 2>&1
             list_status=$?
-            run_with_timeout 120 "$run_log" "$bin" --nocapture --test-threads=1
+            run_with_timeout 120 "$run_log" "$bin_abs" --nocapture --test-threads=1
             status=$?
+            popd >/dev/null
             if [ "$status" -ne 0 ]; then
-              lldb_status="$(run_lldb "$bin" "$label")"
+              pushd libcrux-ml-kem >/dev/null
+              lldb_status="$(run_lldb "$bin_abs" "$label")"
+              popd >/dev/null
             fi
 
             {
               echo "- \`${label}\`: list_exit=${list_status}, direct_exit=${status}, lldb_exit=${lldb_status}"
-              echo "  binary: \`${bin}\`"
+              echo "  binary: \`${bin_abs}\`"
+              echo "  cwd: \`libcrux-ml-kem\`"
               echo "  tests listed: \`$(wc -l < "$list_log" | tr -d ' ')\`"
               echo "  test result lines: \`$(grep -c 'test result:' "$run_log" || true)\`"
               echo "  backend markers: \`$(grep -c 'AARCH64_REJ_BACKEND' "$run_log" || true)\`"
@@ -236,7 +242,7 @@ jobs:
               echo "  first signal: \`$(grep -Eim1 'signal:|SIGSEGV|SIGILL|EXC_BAD|stop reason|Illegal instruction|Segmentation fault' "$run_log" "$out_dir/${label}.lldb.log" 2>/dev/null || true)\`"
             } >> "$summary"
 
-            record_macho "$bin" "$label"
+            record_macho "$bin_abs" "$label"
           }
 
           build_and_run_mode() {
