@@ -157,9 +157,13 @@ jobs:
             local bin_abs="$2"
             local cmd_file="$out_dir/${mode}.lldb.commands"
             local nm_file="$out_dir/${mode}.generate-keypair-nm.txt"
+            local h8997_addr
+            local h8997_fault_addr
             local index=1
 
             nm -nm "$bin_abs" | grep 'generate_keypair' > "$nm_file" 2>&1
+            h8997_addr="$(awk '/h8997d6f42564fb09/ { print $1; exit }' "$nm_file")"
+            h8997_fault_addr="$(printf '0x%016x' $((16#${h8997_addr} + 812)))"
 
             {
               printf '%s\n' 'settings set -- target.run-args kyber1024_nist_known_answer_tests --exact --nocapture --test-threads=1'
@@ -170,6 +174,7 @@ jobs:
                 set -- $line
                 printf 'breakpoint set --address 0x%s\n' "$1"
               done < "$nm_file"
+              printf 'breakpoint set --address %s\n' "$h8997_fault_addr"
               printf '%s\n' 'breakpoint list'
               while IFS= read -r line; do
                 [ -n "$line" ] || continue
@@ -179,6 +184,7 @@ jobs:
               printf '%s\n' 'continue'
               printf '%s\n' 'thread backtrace all'
               printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
+              printf '%s\n' 'memory read --format x --size 8 --count 16 $sp+184'
               printf '%s\n' 'disassemble --pc --count 20'
               printf '%s\n' 'image lookup -a $pc'
             } > "$cmd_file"
