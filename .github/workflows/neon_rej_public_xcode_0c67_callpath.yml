@@ -159,11 +159,13 @@ jobs:
             local nm_file="$out_dir/${mode}.generate-keypair-nm.txt"
             local h8997_addr
             local h8997_fault_addr
+            local h8997_window_addr
             local index=1
 
             nm -nm "$bin_abs" | grep 'generate_keypair' > "$nm_file" 2>&1
             h8997_addr="$(awk '/h8997d6f42564fb09/ { print $1; exit }' "$nm_file")"
             h8997_fault_addr="$(printf '0x%016x' $((16#${h8997_addr} + 812)))"
+            h8997_window_addr="$(printf '0x%016x' $((16#${h8997_addr} + 700)))"
 
             {
               printf '%s\n' 'settings set -- target.run-args kyber1024_nist_known_answer_tests --exact --nocapture --test-threads=1'
@@ -181,7 +183,9 @@ jobs:
                 printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'thread backtrace -c 8' -o 'continue'"
                 index=$((index + 1))
               done < "$nm_file"
+              printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'memory read --format x --size 8 --count 16 \$sp+184' -o 'disassemble --start-address ${h8997_window_addr} --count 48' -o 'breakpoint disable ${index}' -o 'continue'"
               printf '%s\n' 'continue'
+              printf '%s\n' 'process status'
               printf '%s\n' 'thread backtrace all'
               printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
               printf '%s\n' 'memory read --format x --size 8 --count 16 $sp+184'
