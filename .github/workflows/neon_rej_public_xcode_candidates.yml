@@ -1,0 +1,229 @@
+name: NEON rejection sampler public Xcode candidates
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  historical-xcode-candidates:
+    name: historical Xcode candidate probe (${{ matrix.commit_short }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - commit_short: b9fa21c6
+            commit: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+          - commit_short: 0c67a85b
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+          - commit_short: 76ab582c
+            commit: 76ab582c79998d5ef77e6e6b6d287c6b1ff0106d
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.commit }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Historical release Xcode candidate probe
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          out_dir="$PWD/neon-rej-diagnostics/historical-${{ matrix.commit_short }}/xcode-candidates"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          failure=0
+
+          {
+            echo "# Historical release Xcode candidate probe"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Test surface: full \`libcrux-ml-kem\` package release and explicit \`+neon\` release"
+            echo
+            echo "## Runner"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            echo "xcode-select:"
+            xcode-select -p || true
+            echo "installed Xcodes:"
+            ls -1d /Applications/Xcode*.app 2>/dev/null || true
+            echo "default xcodebuild:"
+            xcodebuild -version || true
+            echo "\`\`\`"
+            echo
+            echo "## Historical Toolchain"
+            echo
+            echo "\`\`\`text"
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          record_toolchain() {
+            local developer_dir="$1"
+            {
+              echo "### Selected developer toolchain"
+              echo
+              echo "\`\`\`text"
+              echo "DEVELOPER_DIR=${developer_dir}"
+              DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+              DEVELOPER_DIR="${developer_dir}" cc --version || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+          }
+
+          record_macho_versions() {
+            local title="$1"
+            local target_dir="$2"
+            shift 2
+            {
+              echo "### ${title}"
+              echo
+            } >> "$summary"
+            for pattern in "$@"; do
+              find "${target_dir}" -maxdepth 1 -type f -name "${pattern}" -print 2>/dev/null \
+                | sort \
+                | while IFS= read -r bin; do
+                    if file "${bin}" | grep -q 'Mach-O.*executable'; then
+                      {
+                        echo "#### $(basename "${bin}")"
+                        echo
+                        echo "\`\`\`text"
+                        otool -l "${bin}" \
+                          | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}'
+                        echo "\`\`\`"
+                        echo
+                      } >> "$summary"
+                    fi
+                  done
+            done
+          }
+
+          run_case() {
+            local label="$1"
+            local developer_dir="$2"
+            local mode="$3"
+            local log="$out_dir/${label}-${mode}.log"
+            local status
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                cargo +1.78.0 test --verbose --release \
+                > "$log" 2>&1
+              status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release \
+                > "$log" 2>&1
+              status=$?
+            fi
+            popd >/dev/null
+
+            {
+              echo "- \`${label} ${mode}\`: exit=${status}, log=\`${log}\`"
+              echo "  test result lines: \`$(grep -c 'test result:' "$log" || true)\`"
+              echo "  failure-like lines: \`$(grep -Eic '(^error:|FAILED|panicked|AddressSanitizer|LeakSanitizer|Illegal instruction|signal)' "$log" || true)\`"
+            } >> "$summary"
+
+            record_macho_versions "${label} ${mode} Mach-O versions" \
+              "target/release/deps" \
+              "libcrux_ml_kem-*" "ml_kem-*" "self-*" "nistkats-*"
+
+            if [ "$status" -ne 0 ]; then
+              failure=1
+            fi
+          }
+
+          for xcode_path in /Applications/Xcode_15.0.1.app /Applications/Xcode_15.4.app /Applications/Xcode.app; do
+            label="$(basename "$xcode_path" .app)"
+            {
+              echo "## ${label}"
+              echo
+            } >> "$summary"
+
+            if [ ! -d "$xcode_path" ]; then
+              {
+                echo "Skipped: \`${xcode_path}\` is not installed on this runner."
+                echo
+              } >> "$summary"
+              continue
+            fi
+
+            developer_dir="${xcode_path}/Contents/Developer"
+            record_toolchain "$developer_dir"
+            run_case "$label" "$developer_dir" ordinary
+            run_case "$label" "$developer_dir" plus-neon
+          done
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload Xcode candidate diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-candidates-${{ matrix.commit_short }}
+          path: neon-rej-diagnostics/historical-${{ matrix.commit_short }}/xcode-candidates
