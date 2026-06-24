@@ -213,6 +213,7 @@ jobs:
             local symbol_list="$out_dir/${mode}.symbols.txt"
             local objdump_file="$out_dir/${mode}.objdump-symbols-raw.txt"
             local hits_file="$out_dir/${mode}.objdump-hit-context.txt"
+            local full_branch_context="$out_dir/${mode}.full-disassembly-low-branch-context.txt"
             local branch_file="$out_dir/${mode}.bad-branch-hits.txt"
 
             nm -nm "$bin_abs" > "$nm_file" 2>&1
@@ -242,6 +243,7 @@ jobs:
             DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --version \
               > "$out_dir/${mode}.llvm-objdump-version.txt" 2>&1
 
+            : > "$objdump_file"
             while IFS= read -r symbol; do
               [ -n "$symbol" ] || continue
               {
@@ -257,12 +259,20 @@ jobs:
                   "$bin_abs" 2>&1
               } >> "$objdump_file"
             done < <(
-              awk '/ T / || / t / || / external .*__TEXT,__text/ || / non-external .*__TEXT,__text/ {print $NF}' "$nm_file" \
+              awk '/\(__TEXT,__text\)/ && /external|non-external/ {print $NF}' "$nm_file" \
                 | grep -E 'generate_keypair|rej_sample|sample_matrix|serialize_public_key|serialize_secret_key' \
                 | sort -u
             )
 
             grep -E '\bb[[:space:]]+0xff[0-9a-f]+' "$objdump_file" > "$branch_file" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$bin_abs" 2>&1 \
+              | grep -E -B12 -A12 '\bb[[:space:]]+0xff[0-9a-f]+' \
+              > "$full_branch_context" || true
             emit_context_hits "$objdump_file" "$hits_file"
 
             {
@@ -276,6 +286,12 @@ jobs:
               echo
               echo "\`\`\`text"
               cat "$branch_file"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} full disassembly low-branch context"
+              echo
+              echo "\`\`\`text"
+              cat "$full_branch_context"
               echo "\`\`\`"
               echo
             } >> "$summary"
