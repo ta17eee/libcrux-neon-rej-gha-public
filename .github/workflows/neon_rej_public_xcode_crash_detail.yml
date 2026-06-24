@@ -1,0 +1,284 @@
+name: NEON rejection sampler public Xcode crash detail
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  historical-xcode-crash-detail:
+    name: historical Xcode 15.0.1 crash detail (${{ matrix.commit_short }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - commit_short: b9fa21c6
+            commit: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+          - commit_short: 0c67a85b
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+          - commit_short: 76ab582c
+            commit: 76ab582c79998d5ef77e6e6b6d287c6b1ff0106d
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.commit }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Xcode 15.0.1 crash detail
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          out_dir="$PWD/neon-rej-diagnostics/historical-${{ matrix.commit_short }}/xcode-15.0.1-crash-detail"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+
+          {
+            echo "# Xcode 15.0.1 crash detail"
+            echo
+            echo "Commit: \`${{ matrix.commit }}\`"
+            echo "Selected developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" cc --version || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Xcode 15.0.1 developer dir is absent; cannot run detail probe." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          patch_markers() {
+            local target_file="polynomials-aarch64/src/lib.rs"
+            local platform_file="sys/platform/src/lib.rs"
+
+            if [ -f "$target_file" ]; then
+              ruby -0pi -e '
+                pre_old = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        rejsample::rej_sample(a, out)\n    }\n"
+                pre_new = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        static AARCH64_REJ_BACKEND_CALLS: std::sync::atomic::AtomicUsize =\n            std::sync::atomic::AtomicUsize::new(0);\n        let call = AARCH64_REJ_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;\n        if call <= 16 || call.is_power_of_two() {\n            eprintln!(\"AARCH64_REJ_BACKEND kind=neon call={call} input_len={} output_len={}\", a.len(), out.len());\n        }\n        rejsample::rej_sample(a, out)\n    }\n"
+                fallback_old = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        // FIXME: The code in rejsample fails on the CI machines.\n        // We need to understand why and fix it before using it.\n        // We use the portable version in the meantime.\n        rej_sample(a, out)\n    }\n"
+                fallback_new = "    fn rej_sample(a: &[u8], out: &mut [i16]) -> usize {\n        // FIXME: The code in rejsample fails on the CI machines.\n        // We need to understand why and fix it before using it.\n        // We use the portable version in the meantime.\n        static AARCH64_REJ_BACKEND_CALLS: std::sync::atomic::AtomicUsize =\n            std::sync::atomic::AtomicUsize::new(0);\n        let call = AARCH64_REJ_BACKEND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;\n        if call <= 16 || call.is_power_of_two() {\n            eprintln!(\"AARCH64_REJ_BACKEND kind=portable-fallback call={call} input_len={} output_len={}\", a.len(), out.len());\n        }\n        rej_sample(a, out)\n    }\n"
+                if $_.include?(pre_old)
+                  $_ = $_.sub(pre_old, pre_new)
+                elsif $_.include?(fallback_old)
+                  $_ = $_.sub(fallback_old, fallback_new)
+                else
+                  warn "backend rej_sample wrapper block not found\n"
+                end
+              ' "$target_file" >> "$summary" 2>&1
+              echo "backend marker patch attempted" >> "$summary"
+            else
+              echo "backend marker target missing: ${target_file}" >> "$summary"
+            fi
+
+            if [ -f "$platform_file" ]; then
+              ruby -0pi -e '
+                $_ = $_.sub("#[cfg(test)]\n#[macro_use]\nextern crate std;", "#[macro_use]\nextern crate std;")
+                old = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            use macos_arm::*;\n            adv_simd()\n        }\n"
+                new = "    pub fn simd128_support() -> bool {\n        #[cfg(all(target_arch = \"aarch64\", target_os = \"macos\"))]\n        {\n            use macos_arm::*;\n            let result = adv_simd();\n            eprintln!(\"DISPATCH_DECISION simd128_support cfg_simd128={} target_aarch64={} result={}\", cfg!(feature = \"simd128\"), cfg!(target_arch = \"aarch64\"), result);\n            result\n        }\n"
+                if $_.include?(old)
+                  $_ = $_.sub(old, new)
+                else
+                  warn "simd128 macos block not found\n"
+                end
+              ' "$platform_file" >> "$summary" 2>&1
+              echo "dispatch marker patch attempted" >> "$summary"
+            else
+              echo "dispatch marker target missing: ${platform_file}" >> "$summary"
+            fi
+          }
+
+          record_macho() {
+            local bin="$1"
+            local label="$2"
+            {
+              echo "### ${label} Mach-O"
+              echo
+              echo "\`\`\`text"
+              file "$bin" || true
+              otool -hv "$bin" || true
+              otool -l "$bin" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              codesign -dv --verbose=4 "$bin" || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+          }
+
+          run_lldb() {
+            local bin="$1"
+            local label="$2"
+            local log="$out_dir/${label}.lldb.log"
+            lldb --batch \
+              -o "settings set target.run-args --nocapture --test-threads=1" \
+              -o "run" \
+              -o "thread backtrace all" \
+              -o "register read" \
+              -o "disassemble --pc" \
+              -- "$bin" > "$log" 2>&1
+            echo "$?"
+          }
+
+          run_binary() {
+            local bin="$1"
+            local label="$2"
+            local list_log="$out_dir/${label}.list.log"
+            local run_log="$out_dir/${label}.direct.log"
+            local status
+            local lldb_status="skipped"
+
+            "$bin" --list > "$list_log" 2>&1
+            list_status=$?
+            "$bin" --nocapture --test-threads=1 > "$run_log" 2>&1
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              lldb_status="$(run_lldb "$bin" "$label")"
+            fi
+
+            {
+              echo "- \`${label}\`: list_exit=${list_status}, direct_exit=${status}, lldb_exit=${lldb_status}"
+              echo "  binary: \`${bin}\`"
+              echo "  tests listed: \`$(wc -l < "$list_log" | tr -d ' ')\`"
+              echo "  test result lines: \`$(grep -c 'test result:' "$run_log" || true)\`"
+              echo "  backend markers: \`$(grep -c 'AARCH64_REJ_BACKEND' "$run_log" || true)\`"
+              echo "  dispatch markers: \`$(grep -c 'DISPATCH_DECISION' "$run_log" || true)\`"
+              echo "  first signal: \`$(grep -Eim1 'signal:|SIGSEGV|SIGILL|EXC_BAD|stop reason|Illegal instruction|Segmentation fault' "$run_log" "$out_dir/${label}.lldb.log" 2>/dev/null || true)\`"
+            } >> "$summary"
+
+            record_macho "$bin" "$label"
+          }
+
+          build_and_run_mode() {
+            local variant="$1"
+            local mode="$2"
+            local build_log="$out_dir/${variant}.${mode}.build-no-run.log"
+            local status
+
+            {
+              echo
+              echo "## Variant: ${variant}; mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              status=$?
+            fi
+            popd >/dev/null
+
+            {
+              echo "- build no-run exit: \`${status}\`"
+              echo "- rustc simd128 cfg lines: \`$(grep -c -- \"--cfg 'feature=\\\"simd128\\\"'\" "$build_log" || true)\`"
+              echo "- compiler error lines: \`$(grep -Eic '(^error:|ld:|clang:)' "$build_log" || true)\`"
+            } >> "$summary"
+
+            if [ "$status" -ne 0 ]; then
+              return
+            fi
+
+            while IFS= read -r bin; do
+              name="$(basename "$bin")"
+              case "$name" in
+                libcrux_ml_kem-*|ml_kem-*|nistkats-*|self-*)
+                  if file "$bin" | grep -q 'Mach-O.*executable'; then
+                    run_binary "$bin" "${variant}.${mode}.${name}"
+                  fi
+                  ;;
+              esac
+            done < <(find target/release/deps -maxdepth 1 -type f -print | sort)
+          }
+
+          build_and_run_mode uninstrumented ordinary
+          build_and_run_mode uninstrumented plus-neon
+          patch_markers
+          build_and_run_mode marked ordinary
+          build_and_run_mode marked plus-neon
+
+          cat "$summary"
+          true
+
+      - name: Upload Xcode 15.0.1 crash diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-crash-detail-${{ matrix.commit_short }}
+          path: neon-rej-diagnostics/historical-${{ matrix.commit_short }}/xcode-15.0.1-crash-detail
+          if-no-files-found: error
