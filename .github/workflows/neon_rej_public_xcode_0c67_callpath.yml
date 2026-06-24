@@ -154,14 +154,27 @@ jobs:
 
           make_lldb_commands() {
             local mode="$1"
+            local bin_abs="$2"
             local cmd_file="$out_dir/${mode}.lldb.commands"
+            local nm_file="$out_dir/${mode}.generate-keypair-nm.txt"
+            local index=1
+
+            nm -nm "$bin_abs" | grep 'generate_keypair' > "$nm_file" 2>&1
+
             {
               printf '%s\n' 'settings set -- target.run-args kyber1024_nist_known_answer_tests --exact --nocapture --test-threads=1'
               printf '%s\n' 'settings set stop-disassembly-display never'
               printf '%s\n' 'image lookup -rn generate_keypair'
-              printf '%s\n' 'breakpoint set --func-regex generate_keypair'
+              while IFS= read -r line; do
+                set -- $line
+                printf 'breakpoint set --address 0x%s\n' "$1"
+              done < "$nm_file"
               printf '%s\n' 'breakpoint list'
-              printf '%s\n' "breakpoint command add 1 -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'thread backtrace -c 8' -o 'continue'"
+              while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                printf "%s\n" "breakpoint command add ${index} -o 'frame info' -o 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30' -o 'thread backtrace -c 8' -o 'continue'"
+                index=$((index + 1))
+              done < "$nm_file"
               printf '%s\n' 'run'
               printf '%s\n' 'thread backtrace all'
               printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x25 x30'
@@ -216,7 +229,7 @@ jobs:
               return
             fi
             bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
-            cmd_file="$(make_lldb_commands "$mode")"
+            cmd_file="$(make_lldb_commands "$mode" "$bin_abs")"
 
             {
               echo "- selected binary: \`${bin_abs}\`"
