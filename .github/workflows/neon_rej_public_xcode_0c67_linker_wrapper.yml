@@ -24,6 +24,12 @@ jobs:
           - mode: ordinary
             variant: ld_classic
             extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - mode: ordinary
+            variant: link_dead_code
+            extra_rustflags: "-C link-dead-code=yes"
+          - mode: plus-neon
+            variant: link_dead_code
+            extra_rustflags: "-C target_feature=+neon -C link-dead-code=yes"
 
     steps:
       - name: Checkout public upstream libcrux
