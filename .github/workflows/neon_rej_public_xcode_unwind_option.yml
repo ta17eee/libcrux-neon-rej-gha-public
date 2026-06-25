@@ -1,0 +1,367 @@
+name: NEON rejection sampler public Xcode unwind option
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  unwind-option:
+    name: ${{ matrix.case_name }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_name: b9fa
+            upstream_ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            test_filter: "mlkem768::tests::pk_validation"
+            binary_glob: "libcrux_ml_kem-*"
+            preferred_object_prefix: "libcrux_ml_kem-"
+            variant: default
+            extra_rustflags: ""
+          - case_name: b9fa
+            upstream_ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            test_filter: "mlkem768::tests::pk_validation"
+            binary_glob: "libcrux_ml_kem-*"
+            preferred_object_prefix: "libcrux_ml_kem-"
+            variant: no_compact_unwind
+            extra_rustflags: "-C link-arg=-Wl,-no_compact_unwind"
+          - case_name: b9fa
+            upstream_ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            test_filter: "mlkem768::tests::pk_validation"
+            binary_glob: "libcrux_ml_kem-*"
+            preferred_object_prefix: "libcrux_ml_kem-"
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - case_name: 0c67
+            upstream_ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            test_filter: "kyber1024_nist_known_answer_tests"
+            binary_glob: "nistkats-*"
+            preferred_object_prefix: "nistkats-"
+            variant: default
+            extra_rustflags: ""
+          - case_name: 0c67
+            upstream_ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            test_filter: "kyber1024_nist_known_answer_tests"
+            binary_glob: "nistkats-*"
+            preferred_object_prefix: "nistkats-"
+            variant: no_compact_unwind
+            extra_rustflags: "-C link-arg=-Wl,-no_compact_unwind"
+          - case_name: 0c67
+            upstream_ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            test_filter: "kyber1024_nist_known_answer_tests"
+            binary_glob: "nistkats-*"
+            preferred_object_prefix: "nistkats-"
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.upstream_ref }}
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          DEVELOPER_DIR=/Applications/Xcode_15.0.1.app/Contents/Developer xcodebuild -version || true
+          DEVELOPER_DIR=/Applications/Xcode_15.0.1.app/Contents/Developer ld -v || true
+          DEVELOPER_DIR=/Applications/Xcode_15.0.1.app/Contents/Developer ld -version_details || true
+          DEVELOPER_DIR=/Applications/Xcode_15.0.1.app/Contents/Developer ld -help 2>&1 | grep -E 'compact|unwind|ld_classic' || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Probe unwind option
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          case_name="${{ matrix.case_name }}"
+          upstream_ref="${{ matrix.upstream_ref }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          target_hash="${{ matrix.target_hash }}"
+          target_offset_hex="${{ matrix.target_offset_hex }}"
+          test_filter="${{ matrix.test_filter }}"
+          binary_glob="${{ matrix.binary_glob }}"
+          preferred_object_prefix="${{ matrix.preferred_object_prefix }}"
+          out_dir="$PWD/neon-rej-diagnostics/${case_name}-unwind-option-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          map_file="$out_dir/ordinary.link.map"
+
+          {
+            echo "# ${case_name} unwind option probe"
+            echo
+            echo "Commit: \`${upstream_ref}\`"
+            echo "Xcode: \`xcode-15.0.1\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" ld -help 2>&1 | grep -E 'compact|unwind|ld_classic' || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/${binary_glob}; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                if [ -z "$first_match" ]; then
+                  first_match="$obj"
+                fi
+                case "$(basename "$obj")" in
+                  ${preferred_object_prefix}*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            if [ -n "$first_match" ]; then
+              printf '%s\n' "$first_match"
+              return 0
+            fi
+            return 1
+          }
+
+          extract_target_line() {
+            local path="$1"
+            local symbol_addr="$2"
+            local out_base="$3"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$path" > "${out_base}.disassembly.txt" 2>&1
+            python3 - "${out_base}.disassembly.txt" "$target_addr" > "${out_base}.target-line.txt" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = pat.match(line)
+                  if m and int(m.group(1), 16) == target:
+                      print(line.rstrip())
+                      raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            python3 - "${out_base}.disassembly.txt" "$target_addr" > "${out_base}.target-window.txt" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          start = target - 0x40
+          stop = target + 0x50
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = pat.match(line)
+                  if m:
+                      addr = int(m.group(1), 16)
+                      if start <= addr <= stop:
+                          print(line.rstrip())
+          PY
+          }
+
+          rustflags="-C save-temps ${extra_rustflags} -C link-arg=-Wl,-map,${map_file}"
+          {
+            echo "## Ordinary mode"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo
+          } >> "$summary"
+
+          pushd libcrux-ml-kem >/dev/null
+          cargo +1.78.0 clean >> "$summary" 2>&1
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --verbose --release --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --release "${test_filter}" -- --exact --nocapture \
+            > "$out_dir/focused-test.log" 2>&1
+          run_status=$?
+          popd >/dev/null
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -ne 0 ]; then
+            {
+              echo "### Build failure tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 160 "$out_dir/build.log"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          pushd libcrux-ml-kem >/dev/null
+          bin="$(find_test_binary)"
+          obj="$(find_target_object)"
+          if [ -n "$bin" ]; then
+            bin_abs="$PWD/$bin"
+          fi
+          if [ -n "$obj" ]; then
+            obj_abs="$PWD/$obj"
+          fi
+          popd >/dev/null
+
+          {
+            echo "- final binary: \`${bin_abs:-not found}\`"
+            echo "- target object: \`${obj_abs:-not found}\`"
+            echo
+          } >> "$summary"
+
+          if [ -n "${bin_abs:-}" ]; then
+            nm -nm "$bin_abs" > "$out_dir/final.nm.txt" 2>&1
+            final_addr="$(awk -v h="$target_hash" '$0 ~ h {print $1; exit}' "$out_dir/final.nm.txt")"
+            if [ -n "$final_addr" ]; then
+              extract_target_line "$bin_abs" "0x${final_addr#0x}" "$out_dir/final"
+            fi
+          fi
+
+          if [ -n "${obj_abs:-}" ]; then
+            nm -nm "$obj_abs" > "$out_dir/object.nm.txt" 2>&1
+            obj_addr="$(awk -v h="$target_hash" '$0 ~ h {print $1; exit}' "$out_dir/object.nm.txt")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump -r "$obj_abs" > "$out_dir/object.llvm-reloc.txt" 2>&1 || true
+            otool -r "$obj_abs" > "$out_dir/object.otool-reloc.txt" 2>&1 || true
+            if [ -n "$obj_addr" ]; then
+              extract_target_line "$obj_abs" "0x${obj_addr#0x}" "$out_dir/object"
+            fi
+          fi
+
+          {
+            echo "## Target lines"
+            echo
+            echo "### Object"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object.target-line.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "### Final"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/final.target-line.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 80 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+          } >> "$summary"
+
+          cat "$summary"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-unwind-option-${{ matrix.case_name }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/**
