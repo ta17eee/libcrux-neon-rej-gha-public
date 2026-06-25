@@ -92,7 +92,7 @@ jobs:
             echo "Xcode: \`${{ matrix.xcode_label }}\`"
             echo "Developer dir: \`${developer_dir}\`"
             echo "Test filter: \`kyber1024_nist_known_answer_tests\`"
-            echo "Probe: stop at first \`h8997 + 812\`, set write watchpoint on \`$sp + 184\`, then continue through several events."
+            echo 'Probe: stop at first `h8997 + 812`, set write watchpoint on `$sp + 184`, then continue through several events.'
             echo
             echo "## Runner and toolchain"
             echo
