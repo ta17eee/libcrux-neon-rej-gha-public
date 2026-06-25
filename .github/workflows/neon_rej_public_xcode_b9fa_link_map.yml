@@ -1,0 +1,366 @@
+name: NEON rejection sampler public Xcode b9fa link map
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  link-map:
+    name: b9fa link map ${{ matrix.xcode_label }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          DEVELOPER_DIR="${{ matrix.developer_dir }}" xcodebuild -version || true
+          DEVELOPER_DIR="${{ matrix.developer_dir }}" xcrun --find cc || true
+          DEVELOPER_DIR="${{ matrix.developer_dir }}" xcrun --find ld || true
+          DEVELOPER_DIR="${{ matrix.developer_dir }}" ld -v || true
+          DEVELOPER_DIR="${{ matrix.developer_dir }}" ld -version_details || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Collect link map and target word
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          xcode_label="${{ matrix.xcode_label }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          out_dir="$PWD/neon-rej-diagnostics/b9fa-link-map-${xcode_label}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          target_hash="hda4635a55fb002f6"
+          target_offset_hex="0x1514"
+          test_filter="mlkem768::tests::pk_validation"
+          map_file="$out_dir/link.map"
+
+          {
+            echo "# b9fa link map probe"
+            echo
+            echo "Commit: \`b9fa21c6d53dc2b7de2e50d1694af284cb55f769\`"
+            echo "Xcode: \`${xcode_label}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Target: \`generate_keypair17h${target_hash} + ${target_offset_hex}\`"
+            echo "Focused test: \`${test_filter}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" ld -help > "$out_dir/ld.help.txt" 2>&1 || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"0x{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/libcrux_ml_kem-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj"
+                return 0
+              fi
+            done < <(find target/release -type f -name 'libcrux_ml_kem-*.o' -print | sort)
+            return 1
+          }
+
+          extract_address_window() {
+            local in_file="$1"
+            local center_hex="$2"
+            local out_file="$3"
+            python3 - "$in_file" "$center_hex" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, center_s = sys.argv[1:]
+          center = int(center_s, 16)
+          start = center - 0x30
+          stop = center + 0x40
+          address_re = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = address_re.match(line)
+                  if not m:
+                      continue
+                  addr = int(m.group(1), 16)
+                  if start <= addr <= stop:
+                      sys.stdout.write(line)
+          PY
+          }
+
+          decode_branch_word() {
+            local disasm_file="$1"
+            local center_hex="$2"
+            python3 - "$disasm_file" "$center_hex" <<'PY'
+          import re
+          import sys
+          path, center_s = sys.argv[1:]
+          center = int(center_s, 16)
+          address_re = re.compile(r"^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+){3}[0-9a-fA-F]{2})\s+(.*)$")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = address_re.match(line)
+                  if not m or int(m.group(1), 16) != center:
+                      continue
+                  bs = bytes.fromhex(m.group(2))
+                  word = int.from_bytes(bs, "little")
+                  imm26 = word & 0x03ffffff
+                  if imm26 & 0x02000000:
+                      imm26 -= 0x04000000
+                  print(f"{m.group(1)}: {m.group(2)} {m.group(3)}")
+                  if (word >> 26) == 0b000101:
+                      print(f"word=0x{word:08x} imm26={imm26} byte_offset={imm26 * 4}")
+                  else:
+                      print(f"word=0x{word:08x} non-B-opcode=0x{word >> 26:x}")
+                  break
+          PY
+          }
+
+          extract_map_context() {
+            local out_file="$1"
+            python3 - "$map_file" "$target_hash" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, needle = sys.argv[1:]
+          try:
+              lines = open(path, "r", errors="replace").read().splitlines()
+          except OSError:
+              sys.exit(0)
+          wanted = []
+          patterns = [needle, "libcrux_ml_kem", "generate_keypair", "rej_sample"]
+          for i, line in enumerate(lines):
+              if any(p in line for p in patterns):
+                  wanted.append(i)
+          emitted = set()
+          for i in wanted:
+              start = max(0, i - 4)
+              stop = min(len(lines), i + 5)
+              for j in range(start, stop):
+                  if j not in emitted:
+                      print(f"{j + 1}: {lines[j]}")
+                      emitted.add(j)
+              print("---")
+          PY
+          }
+
+          rustflags="-C save-temps -C link-arg=-Wl,-map,${map_file} ${extra_rustflags}"
+
+          {
+            echo "## Ordinary mode"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- link map path: \`${map_file}\`"
+            echo
+          } >> "$summary"
+
+          pushd libcrux-ml-kem >/dev/null
+          cargo +1.78.0 clean >> "$summary" 2>&1
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --verbose --lib --release --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --lib --release "${test_filter}" -- --exact --nocapture \
+            > "$out_dir/focused-test.log" 2>&1
+          run_status=$?
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -eq 0 ]; then
+            binary="$(find_test_binary)"
+            object="$(find_target_object)"
+
+            if [ -n "$binary" ]; then
+              cp "$binary" "$out_dir/final.binary" || true
+              nm -nm "$binary" > "$out_dir/final.nm.txt" 2>&1
+              otool -l "$binary" > "$out_dir/final.otool-l.txt" 2>&1
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump -d --macho --no-show-raw-insn "$binary" > "$out_dir/final.disassembly.no-raw.txt" 2>&1
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump -d --macho "$binary" > "$out_dir/final.disassembly.txt" 2>&1
+              final_symbol="$(awk -v h="$target_hash" '$0 ~ h {print $1; exit}' "$out_dir/final.nm.txt")"
+              final_target=""
+              if [ -n "$final_symbol" ]; then
+                final_target="$(add_hex "$final_symbol" "$target_offset_hex")"
+                extract_address_window "$out_dir/final.disassembly.txt" "$final_target" "$out_dir/final.target-window.txt"
+                decode_branch_word "$out_dir/final.disassembly.txt" "$final_target" > "$out_dir/final.target-decode.txt"
+              fi
+            fi
+
+            if [ -n "$object" ]; then
+              cp "$object" "$out_dir/object.o" || true
+              nm -nm "$object" > "$out_dir/object.nm.txt" 2>&1
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump -d --macho "$object" > "$out_dir/object.disassembly.txt" 2>&1
+              object_symbol="$(awk -v h="$target_hash" '$0 ~ h {print $1; exit}' "$out_dir/object.nm.txt")"
+              object_target=""
+              if [ -n "$object_symbol" ]; then
+                object_target="$(add_hex "$object_symbol" "$target_offset_hex")"
+                extract_address_window "$out_dir/object.disassembly.txt" "$object_target" "$out_dir/object.target-window.txt"
+                decode_branch_word "$out_dir/object.disassembly.txt" "$object_target" > "$out_dir/object.target-decode.txt"
+              fi
+            fi
+
+            extract_map_context "$out_dir/link-map.context.txt"
+
+            {
+              echo "### Target word"
+              echo
+              echo "- selected binary: \`${binary:-missing}\`"
+              echo "- target object: \`${object:-missing}\`"
+              echo "- final target address: \`${final_target:-missing}\`"
+              echo "- object target address: \`${object_target:-missing}\`"
+              echo
+              echo "#### Final target decode"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/final.target-decode.txt" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "#### Object target decode"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/object.target-decode.txt" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "#### Link map context"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/link-map.context.txt" 2>/dev/null | head -240 || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          else
+            {
+              echo "### Build failure tail"
+              echo
+              echo "\`\`\`text"
+              tail -120 "$out_dir/build.log"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          fi
+
+          {
+            echo "### Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -80 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+          } >> "$summary"
+
+          popd >/dev/null
+          cat "$summary"
+          exit 0
+
+      - name: Upload b9fa link map diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-b9fa-link-map-${{ matrix.xcode_label }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/**
+          if-no-files-found: warn
