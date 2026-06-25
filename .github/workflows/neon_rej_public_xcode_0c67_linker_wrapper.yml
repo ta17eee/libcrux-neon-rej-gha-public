@@ -1,0 +1,494 @@
+name: NEON rejection sampler public Xcode 0c67 linker wrapper
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  linker-wrapper:
+    name: 0c67 wrapper ${{ matrix.mode }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: ordinary
+            variant: default
+            extra_rustflags: ""
+          - mode: plus-neon
+            variant: default
+            extra_rustflags: "-C target_feature=+neon"
+          - mode: ordinary
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Capture linker invocation and target word evidence
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-linker-wrapper-${mode}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          map_file="$out_dir/nistkats.link.map"
+          map_snapshot="$out_dir/nistkats.no-run.link.map"
+          wrapper="$PWD/linker-wrapper.sh"
+          failure=0
+
+          {
+            echo "# 0c67 linker wrapper probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`xcode-15.0.1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          cat > "$wrapper" <<'SH'
+          #!/bin/bash
+          set +e
+          out_dir="${LINKER_WRAPPER_OUT_DIR:-.}"
+          mkdir -p "$out_dir"
+          argv_log="$out_dir/linker-wrapper-argv.log"
+          dash_log="$out_dir/linker-wrapper-cc-dash.log"
+          real_cc="$(xcrun --find cc 2>/dev/null)"
+          if [ -z "$real_cc" ]; then
+            real_cc="/usr/bin/cc"
+          fi
+
+          {
+            echo "=== invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            echo "pwd=$(pwd)"
+            echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+            echo "real_cc=${real_cc}"
+            i=0
+            for arg in "$@"; do
+              printf 'arg[%d]=%q\n' "$i" "$arg"
+              i=$((i + 1))
+            done
+            echo
+          } >> "$argv_log" 2>&1
+
+          {
+            echo "=== cc -### invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            echo "real_cc=${real_cc}"
+            "$real_cc" -### "$@"
+            echo "cc_dash_status=$?"
+            echo
+          } >> "$dash_log" 2>&1
+
+          exec "$real_cc" "$@"
+          SH
+          chmod +x "$wrapper"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                if [ -z "$first_match" ]; then
+                  first_match="$obj"
+                fi
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            if [ -n "$first_match" ]; then
+              printf '%s\n' "$first_match"
+              return 0
+            fi
+            return 1
+          }
+
+          extract_windows() {
+            local kind="$1"
+            local path="$2"
+            local symbol_addr="$3"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            target_addr="0x${target_addr}"
+
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$out_dir/${kind}.disassembly.txt" 2>&1
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --reloc \
+              "$path" > "$out_dir/${kind}.llvm-reloc.txt" 2>&1
+            otool -rvV "$path" > "$out_dir/${kind}.otool-reloc.txt" 2>&1
+
+            python3 - "$out_dir/${kind}.disassembly.txt" "$target_addr" "$out_dir/${kind}.target-window.txt" <<'PY'
+          import re
+          import sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          start = target - 0x80
+          stop = target + 0x120
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f, open(out, "w") as g:
+              for line in f:
+                  m = pat.match(line)
+                  if m and start <= int(m.group(1), 16) <= stop:
+                      g.write(line)
+          PY
+
+            python3 - "$out_dir/${kind}.llvm-reloc.txt" "$target_addr" "$out_dir/${kind}.reloc-window.txt" <<'PY'
+          import re
+          import sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          start = target - 0x80
+          stop = target + 0x120
+          pat = re.compile(r"\b(?:0x)?([0-9a-fA-F]{4,16})\b")
+          with open(path, "r", errors="replace") as f, open(out, "w") as g:
+              for line in f:
+                  for m in pat.finditer(line):
+                      if start <= int(m.group(1), 16) <= stop:
+                          g.write(line)
+                          break
+          PY
+
+            {
+              echo "### ${kind}"
+              echo
+              echo "- path: \`${path}\`"
+              echo "- symbol address: \`0x${symbol_addr#0x}\`"
+              echo "- target address: \`${target_addr}\`"
+              echo
+              echo "#### Target disassembly window"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${kind}.target-window.txt"
+              echo "\`\`\`"
+              echo
+              echo "#### Relocation window"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${kind}.reloc-window.txt"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          extract_map_context() {
+            local target_addr="$1"
+            python3 - "$map_file" "$target_addr" > "$out_dir/map-context.txt" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, "r", errors="replace").read().splitlines()
+          print("## Map path/header")
+          for line in lines[:24]:
+              print(line)
+          print()
+          print("## Covering map symbol")
+          symbol_re = re.compile(r"^0x([0-9A-Fa-f]+)\s+0x([0-9A-Fa-f]+)\s+\[\s*(\d+)\]\s+(.*)")
+          covering = None
+          symbols = []
+          for idx, line in enumerate(lines, 1):
+              m = symbol_re.match(line)
+              if not m:
+                  continue
+              addr = int(m.group(1), 16)
+              size = int(m.group(2), 16)
+              symbols.append((idx, addr, size, line))
+              if addr <= target < addr + size:
+                  covering = (idx, addr, size, line)
+          if covering:
+              idx, addr, size, line = covering
+              print(f"{idx}: {line}")
+              print(f"target-relative-offset=0x{target - addr:x}")
+          else:
+              print("missing")
+          print()
+          print("## Nearby map symbols")
+          for idx, addr, size, line in symbols:
+              if abs(addr - target) <= 0x400 or (addr <= target < addr + size):
+                  print(f"{idx}: {line}")
+          PY
+            {
+              echo "### Link map context"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/map-context.txt"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          extract_linker_logs() {
+            {
+              echo "## Linker wrapper evidence"
+              echo
+              echo "### argv excerpts"
+              echo
+              echo "\`\`\`text"
+              grep -nE 'nistkats|\.o$|-map|ld_classic|dead_strip|platform_version|syslibroot|object_path_lto|lto|target/release/deps' \
+                "$out_dir/linker-wrapper-argv.log" | head -n 240 || true
+              echo "\`\`\`"
+              echo
+              echo "### clang driver -### excerpts"
+              echo
+              echo "\`\`\`text"
+              grep -nE 'nistkats|ld|ld_classic|dead_strip|platform_version|syslibroot|object_path_lto|lto|target/release/deps|-map' \
+                "$out_dir/linker-wrapper-cc-dash.log" | head -n 260 || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          rustflags="-C save-temps -C linker=${wrapper} -C link-arg=-Wl,-map,${map_file} ${extra_rustflags}"
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- map file: \`${map_file}\`"
+            echo "- wrapper: \`${wrapper}\`"
+            echo
+          } >> "$summary"
+
+          export LINKER_WRAPPER_OUT_DIR="$out_dir"
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+          grep -E 'Running `| -C link-arg=| -C target_feature=| -C save-temps| -C linker=| cc | ld | -map,' "$out_dir/build.log" \
+            > "$out_dir/build-command-lines.txt" 2>&1 || true
+
+          if [ "$build_status" -eq 0 ] && [ -f "$map_file" ]; then
+            cp "$map_file" "$map_snapshot"
+          fi
+
+          if [ "$build_status" -eq 0 ]; then
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              run_with_timeout 180 \
+              cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --release --test nistkats kyber1024_nist_known_answer_tests -- --exact --nocapture \
+              > "$out_dir/focused-test.log" 2>&1
+            run_status=$?
+          else
+            run_status=125
+            : > "$out_dir/focused-test.log"
+          fi
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo
+          } >> "$summary"
+          extract_linker_logs
+
+          if [ "$build_status" -ne 0 ]; then
+            {
+              echo "### Build failure tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 180 "$out_dir/build.log"
+              echo "\`\`\`"
+            } >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          bin="$(find_test_binary)"
+          obj="$(find_target_object)"
+          if [ -z "$bin" ] || [ -z "$obj" ]; then
+            echo "selected binary or target object missing" >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+          bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+          nm -nm "$bin_abs" > "$out_dir/final.nm.txt" 2>&1
+          nm -nm "$obj" > "$out_dir/object.nm.txt" 2>&1
+          final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/final.nm.txt")"
+          obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/object.nm.txt")"
+          final_target_addr="$(add_hex "0x${final_addr#0x}" "$target_offset_hex")"
+
+          {
+            echo "## Selected files"
+            echo
+            echo "- selected binary: \`${bin_abs}\`"
+            echo "- target object: \`${obj}\`"
+            echo "- final symbol address: \`0x${final_addr}\`"
+            echo "- object symbol address: \`0x${obj_addr}\`"
+            echo "- final target address: \`0x${final_target_addr}\`"
+            echo
+            echo "### Binary metadata"
+            echo
+            echo "\`\`\`text"
+            file "$bin_abs" || true
+            shasum -a 256 "$bin_abs" || true
+            otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary" 2>&1
+
+          if [ -f "$map_snapshot" ]; then
+            map_file="$map_snapshot"
+            extract_map_context "0x${final_target_addr}"
+          else
+            echo "map snapshot missing" >> "$summary"
+            failure=1
+          fi
+
+          if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+            extract_windows final "$bin_abs" "0x${final_addr}"
+          else
+            failure=1
+          fi
+          if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+            extract_windows object "$obj" "0x${obj_addr}"
+          else
+            failure=1
+          fi
+
+          {
+            echo "### Object candidates"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object-candidates.txt"
+            echo "\`\`\`"
+            echo
+            echo "### Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 100 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+          } >> "$summary"
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload linker wrapper diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-linker-wrapper-${{ matrix.mode }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/0c67-linker-wrapper-${{ matrix.mode }}-${{ matrix.variant }}
