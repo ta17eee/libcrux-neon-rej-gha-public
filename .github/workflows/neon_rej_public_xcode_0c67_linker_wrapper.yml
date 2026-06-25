@@ -30,6 +30,18 @@ jobs:
           - mode: plus-neon
             variant: link_dead_code
             extra_rustflags: "-C target_feature=+neon -C link-dead-code=yes"
+          - mode: ordinary
+            variant: lto_off
+            extra_rustflags: "-C lto=off"
+          - mode: plus-neon
+            variant: lto_off
+            extra_rustflags: "-C target_feature=+neon -C lto=off"
+          - mode: ordinary
+            variant: lto_off_cgu16
+            extra_rustflags: "-C lto=off -C codegen-units=16"
+          - mode: plus-neon
+            variant: lto_off_cgu16
+            extra_rustflags: "-C target_feature=+neon -C lto=off -C codegen-units=16"
 
     steps:
       - name: Checkout public upstream libcrux
