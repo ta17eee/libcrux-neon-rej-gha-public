@@ -258,6 +258,28 @@ jobs:
           PY
           }
 
+          run_with_timeout() {
+            local timeout_seconds="$1"
+            local log_file="$2"
+            shift 2
+            "$@" > "$log_file" 2>&1 &
+            local child_pid=$!
+            local elapsed=0
+            while kill -0 "$child_pid" 2>/dev/null; do
+              if [ "$elapsed" -ge "$timeout_seconds" ]; then
+                echo "timeout after ${timeout_seconds}s; terminating pid ${child_pid}" >> "$log_file"
+                kill -TERM "$child_pid" 2>/dev/null || true
+                sleep 5
+                kill -KILL "$child_pid" 2>/dev/null || true
+                wait "$child_pid" 2>/dev/null || true
+                return 124
+              fi
+              sleep 1
+              elapsed=$((elapsed + 1))
+            done
+            wait "$child_pid"
+          }
+
           rustflags="-C save-temps ${extra_rustflags} -C link-arg=-Wl,-map,${map_file}"
           {
             echo "## Ordinary mode"
@@ -266,20 +288,17 @@ jobs:
             echo
           } >> "$summary"
 
-          pushd libcrux-ml-kem >/dev/null
-          cargo +1.78.0 clean >> "$summary" 2>&1
+          cargo +1.78.0 clean --manifest-path libcrux-ml-kem/Cargo.toml >> "$summary" 2>&1
           DEVELOPER_DIR="${developer_dir}" \
             RUSTFLAGS="${rustflags}" \
-            cargo +1.78.0 test --verbose --release --no-run \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --no-run \
             > "$out_dir/build.log" 2>&1
           build_status=$?
 
-          DEVELOPER_DIR="${developer_dir}" \
-            RUSTFLAGS="${rustflags}" \
-            cargo +1.78.0 test --release "${test_filter}" -- --exact --nocapture \
-            > "$out_dir/focused-test.log" 2>&1
+          run_with_timeout 180 "$out_dir/focused-test.log" \
+            env DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --release "${test_filter}" -- --exact --nocapture
           run_status=$?
-          popd >/dev/null
 
           {
             echo "- build exit: \`${build_status}\`"
@@ -300,7 +319,6 @@ jobs:
             exit 0
           fi
 
-          pushd libcrux-ml-kem >/dev/null
           bin="$(find_test_binary)"
           obj="$(find_target_object)"
           if [ -n "$bin" ]; then
@@ -309,7 +327,6 @@ jobs:
           if [ -n "$obj" ]; then
             obj_abs="$PWD/$obj"
           fi
-          popd >/dev/null
 
           {
             echo "- final binary: \`${bin_abs:-not found}\`"
