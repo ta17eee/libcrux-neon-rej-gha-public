@@ -1,0 +1,364 @@
+name: NEON rejection sampler public Xcode 0c67 profile thin symbols
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  profile-thin-symbols:
+    name: 0c67 profile thin symbols ${{ matrix.mode }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: ordinary
+            extra_rustflags: ""
+          - mode: plus-neon
+            extra_rustflags: "-C target_feature=+neon"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build and inspect profile thin-LTO symbols
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          old_target_offset_hex="0x2d3c"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-profile-thin-symbols-${mode}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          map_file="$out_dir/nistkats.link.map"
+          wrapper="$PWD/linker-wrapper.sh"
+
+          {
+            echo "# 0c67 profile thin-LTO all-symbol probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`xcode-15.0.1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Profile patch: \`lto = \"thin\", codegen-units = 1\`"
+            echo "Old fat-LTO reference offset: \`${old_target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          python3 - Cargo.toml <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          lines = open(path, encoding="utf-8").read().splitlines(True)
+          start = next(i for i, line in enumerate(lines) if line.strip() == "[profile.release]")
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"\s*\[[^\]]+\]\s*$", lines[i]):
+                  end = i
+                  break
+
+          def upsert(key, value):
+              global end
+              needle = re.compile(rf"\s*{re.escape(key)}\s*=")
+              for i in range(start + 1, end):
+                  if needle.match(lines[i]):
+                      lines[i] = f"{key} = {value}\n"
+                      return
+              lines.insert(start + 1, f"{key} = {value}\n")
+              end += 1
+
+          upsert("lto", '"thin"')
+          upsert("codegen-units", "1")
+          open(path, "w", encoding="utf-8").writelines(lines)
+          PY
+          cp Cargo.toml "$out_dir/Cargo.toml.after-profile-patch"
+
+          cat > "$wrapper" <<'SH'
+          #!/bin/bash
+          set +e
+          out_dir="${LINKER_WRAPPER_OUT_DIR:-.}"
+          mkdir -p "$out_dir"
+          argv_log="$out_dir/linker-wrapper-argv.$$.log"
+          dash_log="$out_dir/linker-wrapper-cc-dash.$$.log"
+          {
+            echo "=== invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            i=0
+            for arg in "$@"; do
+              printf 'arg[%d]=%q\n' "$i" "$arg"
+              i=$((i + 1))
+            done
+            echo
+          } >> "$argv_log" 2>&1
+          {
+            echo "=== cc -### invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            xcrun cc -### "$@"
+            echo "cc_dash_status=$?"
+            echo
+          } >> "$dash_log" 2>&1
+          exec xcrun cc "$@"
+          SH
+          chmod +x "$wrapper"
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          extract_final_symbol_windows() {
+            local path="$1"
+            local nm_file="$out_dir/final.nm.txt"
+            local dis_file="$out_dir/final.disassembly.txt"
+            local symbols_file="$out_dir/final.generate-keypair-symbols.txt"
+            local windows_file="$out_dir/final.generate-keypair-windows.txt"
+            nm -nm "$path" > "$nm_file" 2>&1
+            grep 'generate_keypair17' "$nm_file" > "$symbols_file" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$symbols_file" "$old_target_offset_hex" "$windows_file" <<'PY'
+          import re
+          import sys
+
+          dis_path, symbols_path, offset_s, out_path = sys.argv[1:]
+          offset = int(offset_s, 16)
+          addr_re = re.compile(r"^\s*([0-9a-fA-F]+):")
+          sym_re = re.compile(r"^([0-9a-fA-F]+)\s+")
+          addrs = []
+          for line in open(symbols_path, errors="replace"):
+              m = sym_re.match(line)
+              if m:
+                  addrs.append((int(m.group(1), 16), line.rstrip()))
+          parsed = []
+          for line in open(dis_path, errors="replace"):
+              m = addr_re.match(line)
+              if m:
+                  parsed.append((int(m.group(1), 16), line.rstrip()))
+          interesting = re.compile(
+              r"(rej_sample|orr\s+x28|mov\s+x28|add\s+x28|sub\s+x28|"
+              r"cmp\s+x28|csel.*x28|str\s+x[0-9]+,\s*\[sp, #184\]|"
+              r"ldr\s+x[0-9]+,\s*\[sp, #184\])"
+          )
+          with open(out_path, "w") as out:
+              if not addrs:
+                  out.write("no generate_keypair17 symbol found\n")
+              for sym_addr, sym_line in addrs:
+                  out.write(f"## {sym_line}\n\n")
+                  for label, center in [
+                      ("symbol-start", sym_addr),
+                      ("old-fat-lto-offset", sym_addr + offset),
+                  ]:
+                      out.write(f"### {label} around 0x{center:x}\n")
+                      start = center - 0x80
+                      stop = center + 0x180
+                      for addr, line in parsed:
+                          if start <= addr <= stop:
+                              out.write(line + "\n")
+                      out.write("\n")
+
+                  out.write("### interesting x28/rej_sample contexts\n")
+                  start = sym_addr
+                  stop = sym_addr + 0xa000
+                  matches = []
+                  for i, (addr, line) in enumerate(parsed):
+                      if start <= addr <= stop and interesting.search(line):
+                          matches.append(i)
+                  emitted = set()
+                  for i in matches:
+                      lo = max(0, i - 3)
+                      hi = min(len(parsed), i + 4)
+                      block_key = (lo, hi)
+                      if block_key in emitted:
+                          continue
+                      emitted.add(block_key)
+                      out.write(f"-- context around 0x{parsed[i][0]:x} --\n")
+                      for _, line in parsed[lo:hi]:
+                          out.write(line + "\n")
+                      out.write("\n")
+                  out.write("\n")
+          PY
+          }
+
+          rustflags="-C save-temps -C linker=${wrapper} -C link-arg=-Wl,-map,${map_file} ${extra_rustflags}"
+          {
+            echo "## Cargo profile patch"
+            echo
+            echo "\`\`\`text"
+            sed -n '/^\[profile.release\]/,/^\[/p' Cargo.toml | sed '$ { /^\\[/ d; }'
+            echo "\`\`\`"
+            echo
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- map file: \`${map_file}\`"
+            echo
+          } >> "$summary"
+
+          export LINKER_WRAPPER_OUT_DIR="$out_dir"
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+          grep -E 'Running `| -C embed-bitcode| -C linker-plugin-lto| -C codegen-units| -C lto| -C link-arg=| -C target_feature=| -C save-temps| -C linker=| -map,' "$out_dir/build.log" \
+            > "$out_dir/build-command-lines.txt" 2>&1 || true
+
+          if [ "$build_status" -eq 0 ]; then
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              run_with_timeout 180 \
+              cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --release --test nistkats kyber1024_nist_known_answer_tests -- --exact --nocapture \
+              > "$out_dir/focused-test.log" 2>&1
+            run_status=$?
+          else
+            run_status=125
+            : > "$out_dir/focused-test.log"
+          fi
+
+          bin="$(find_test_binary)"
+          if [ -n "$bin" ]; then
+            extract_final_symbol_windows "$bin"
+          fi
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo "- selected binary: \`${bin:-missing}\`"
+            echo
+            echo "## Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 80 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+            echo
+            echo "## Final generate_keypair symbols"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/final.generate-keypair-symbols.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Interesting final windows"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/final.generate-keypair-windows.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Linker argv final nistkats excerpt"
+            echo
+            echo "\`\`\`text"
+            grep -nE 'target/release/deps/nistkats-|liblibcrux_ml_kem|dead_strip|-map|platform_version|syslibroot|lto_library' \
+              "$out_dir"/linker-wrapper-argv.*.log "$out_dir"/linker-wrapper-cc-dash.*.log | tail -n 200 || true
+            echo "\`\`\`"
+          } >> "$summary"
+
+          find "$out_dir" -name '*.disassembly.txt' -delete
+          find "$out_dir" -name '*.nm.txt' -delete
+
+          cat "$summary"
+          if [ "$build_status" -ne 0 ] || [ "$run_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload profile thin symbol diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-profile-thin-symbols-${{ matrix.mode }}
+          path: neon-rej-diagnostics/0c67-profile-thin-symbols-${{ matrix.mode }}
+          if-no-files-found: warn
