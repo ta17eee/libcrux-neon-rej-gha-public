@@ -1,0 +1,303 @@
+name: NEON rejection sampler public Xcode 0c67 x28 provenance
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  x28-provenance:
+    name: 0c67 x28 provenance ${{ matrix.xcode_label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Trace x28 assignment before h8997 + 812
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          failure=0
+
+          {
+            echo "# 0c67 Xcode h8997 x28 provenance"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Test filter: \`kyber1024_nist_known_answer_tests\`"
+            echo 'Probe: stop at `h8997 + 0x2d3c`, step the candidate x28 assignment, then continue through `h8997 + 812` and `h8997 + 7740` events.'
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" cc --version || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; cannot run x28 provenance probe." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          run_with_timeout() {
+            local seconds="$1"
+            local log="$2"
+            shift 2
+            "$@" > "$log" 2>&1 &
+            local pid=$!
+            (
+              sleep "$seconds"
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "TIMEOUT after ${seconds}s: $*" >> "$log"
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 5
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            ) &
+            local watchdog=$!
+            wait "$pid"
+            local status=$?
+            kill "$watchdog" 2>/dev/null || true
+            wait "$watchdog" 2>/dev/null || true
+            return "$status"
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          make_lldb_commands() {
+            local mode="$1"
+            local bin_abs="$2"
+            local cmd_file="$out_dir/${mode}.x28-provenance.lldb.commands"
+            local nm_file="$out_dir/${mode}.generate-keypair-nm.txt"
+            local h8997_addr x28_assign_addr copy_addr slot_write_addr x28_window_addr
+
+            nm -nm "$bin_abs" | grep 'generate_keypair' > "$nm_file" 2>&1
+            h8997_addr="$(awk '/h8997d6f42564fb09/ { print $1; exit }' "$nm_file")"
+            x28_assign_addr="$(printf '0x%016x' $((16#${h8997_addr} + 0x2d3c)))"
+            copy_addr="$(printf '0x%016x' $((16#${h8997_addr} + 812)))"
+            slot_write_addr="$(printf '0x%016x' $((16#${h8997_addr} + 7740)))"
+            x28_window_addr="$(printf '0x%016x' $((16#${h8997_addr} + 0x2d10)))"
+
+            {
+              printf '%s\n' 'settings set -- target.run-args kyber1024_nist_known_answer_tests --exact --nocapture --test-threads=1'
+              printf '%s\n' 'settings set stop-disassembly-display never'
+              printf '%s\n' 'image lookup -rn generate_keypair'
+              printf '%s\n' 'process launch --stop-at-entry'
+              printf 'breakpoint set --address %s\n' "$x28_assign_addr"
+              printf 'breakpoint set --address %s\n' "$copy_addr"
+              printf 'breakpoint set --address %s\n' "$slot_write_addr"
+              printf '%s\n' 'breakpoint list'
+              printf '%s\n' 'continue'
+              printf '%s\n' 'script print("=== x28 assignment candidate before step ===")'
+              printf '%s\n' 'process status'
+              printf '%s\n' 'thread backtrace all'
+              printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x10 x13 x15 x19 x20 x22 x25 x28 x30'
+              printf '%s\n' 'memory read --format x --size 8 --count 8 $sp+32320'
+              printf "%s\n" "disassemble --start-address ${x28_window_addr} --count 32"
+              printf '%s\n' 'thread step-inst'
+              printf '%s\n' 'script print("=== x28 assignment candidate after single-step ===")'
+              printf '%s\n' 'process status'
+              printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x10 x13 x15 x19 x20 x22 x25 x28 x30'
+              printf '%s\n' 'memory read --format x --size 8 --count 8 $sp+32320'
+              printf '%s\n' 'image lookup -a $pc'
+              for event in 1 2 3 4 5 6; do
+                printf '%s\n' 'continue'
+                printf '%s\n' "script print(\"=== event ${event} after x28 assignment step ===\")"
+                printf '%s\n' 'process status'
+                printf '%s\n' 'breakpoint list'
+                printf '%s\n' 'thread backtrace all'
+                printf '%s\n' 'register read pc sp x0 x1 x2 x3 x8 x9 x10 x13 x15 x19 x20 x22 x25 x28 x30'
+                printf '%s\n' 'memory read --format x --size 8 --count 8 $sp+184'
+                printf '%s\n' 'memory read --format x --size 8 --count 8 $sp+32320'
+                printf '%s\n' 'disassemble --frame --count 24'
+                printf '%s\n' 'image lookup -a $pc'
+              done
+            } > "$cmd_file"
+            printf '%s\n' "$cmd_file"
+          }
+
+          build_mode() {
+            local mode="$1"
+            local build_log="$out_dir/${mode}.build-no-run.log"
+            local bin bin_abs build_status cmd_file lldb_log lldb_status
+
+            {
+              echo
+              echo "## Mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            fi
+            popd >/dev/null
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- build log: \`${build_log}\`"
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              failure=1
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            if [ -z "$bin" ]; then
+              echo "- selected binary: not found" >> "$summary"
+              failure=1
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              nm -nm "$bin_abs" | grep 'generate_keypair' || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+
+            cmd_file="$(make_lldb_commands "$mode" "$bin_abs")"
+            lldb_log="$out_dir/${mode}.x28-provenance-lldb.log"
+            DEVELOPER_DIR="${developer_dir}" \
+              run_with_timeout 240 "$lldb_log" lldb -b -s "$cmd_file" "$bin_abs"
+            lldb_status=$?
+
+            {
+              echo "- lldb exit: \`${lldb_status}\`"
+              echo "- lldb command file: \`${cmd_file}\`"
+              echo "- lldb log: \`${lldb_log}\`"
+              echo
+              echo "### ${mode} x28 provenance highlights"
+              echo
+              echo "\`\`\`text"
+              grep -E '===|stop reason|pc =|x0 =|x1 =|x2 =|x3 =|x8 =|x9 =|x10 =|x13 =|x15 =|x19 =|x28 =|h8997d6f42564fb09|EXC_BAD_ACCESS|Watchpoint' "$lldb_log" | head -n 260 || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            if [ "$lldb_status" -ne 0 ]; then
+              failure=1
+            fi
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload x28 provenance diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-x28-provenance-${{ matrix.xcode_label }}
+          path: neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}
+          if-no-files-found: warn
