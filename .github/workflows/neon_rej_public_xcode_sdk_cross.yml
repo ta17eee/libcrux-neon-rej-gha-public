@@ -1,0 +1,366 @@
+name: NEON rejection sampler public Xcode SDK cross
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  xcode-sdk-cross:
+    name: ${{ matrix.case.label }} ${{ matrix.mode.label }} ${{ matrix.variant.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - label: 0c67
+            commit: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            binary_glob: nistkats-*
+            object_prefix: nistkats-
+            focused_test: kyber1024_nist_known_answer_tests
+          - label: b9fa
+            commit: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            binary_glob: libcrux_ml_kem-*
+            object_prefix: libcrux_ml_kem-
+            focused_test: mlkem768::tests::pk_validation
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+        variant:
+          - label: tools15_0_1_sdk15_0_1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            sdkroot: /Applications/Xcode_15.0.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk
+          - label: tools15_0_1_sdk15_1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            sdkroot: /Applications/Xcode_15.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.2.sdk
+          - label: tools15_1_sdk15_0_1
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+            sdkroot: /Applications/Xcode_15.0.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk
+          - label: tools15_1_sdk15_1
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+            sdkroot: /Applications/Xcode_15.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.2.sdk
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.case.commit }}
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Probe Xcode tools with crossed SDKROOT
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          case_label="${{ matrix.case.label }}"
+          commit="${{ matrix.case.commit }}"
+          mode="${{ matrix.mode.label }}"
+          variant="${{ matrix.variant.label }}"
+          developer_dir="${{ matrix.variant.developer_dir }}"
+          sdkroot="${{ matrix.variant.sdkroot }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          target_hash="${{ matrix.case.target_hash }}"
+          target_offset_hex="${{ matrix.case.target_offset_hex }}"
+          binary_glob="${{ matrix.case.binary_glob }}"
+          object_prefix="${{ matrix.case.object_prefix }}"
+          focused_test="${{ matrix.case.focused_test }}"
+
+          out_dir="$PWD/neon-rej-diagnostics/sdk-cross-${case_label}-${mode}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          row_file="$out_dir/summary.row.tsv"
+
+          {
+            echo "# Xcode SDK cross probe"
+            echo
+            echo "Case: \`${case_label}\`"
+            echo "Commit: \`${commit}\`"
+            echo "Mode: \`${mode}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "SDKROOT: \`${sdkroot}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo "Focused test: \`${focused_test}\`"
+            echo
+            echo "## Runner"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            xcode-select -p || true
+            ls -1d /Applications/Xcode*.app 2>/dev/null || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ] || [ ! -d "${sdkroot}" ]; then
+            {
+              echo "Selected developer dir or SDKROOT is absent; probe skipped."
+              echo
+            } >> "$summary"
+            printf 'case\tmode\tvariant\tdeveloper_version\tsdkroot\tbuild_status\trun_status\tresult\tobject_line\tfinal_line\tlinked_sdk\n' > "$row_file"
+            printf '%s\t%s\t%s\tabsent\t%s\tNA\tNA\tskipped\tNA\tNA\tNA\n' "$case_label" "$mode" "$variant" "$sdkroot" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          {
+            echo "## Selected toolchain"
+            echo
+            echo "\`\`\`text"
+            echo "DEVELOPER_DIR=${developer_dir}"
+            echo "SDKROOT=${sdkroot}"
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            SDKROOT="${sdkroot}" DEVELOPER_DIR="${developer_dir}" xcrun cc -### -arch arm64 -x c /dev/null -o "$out_dir/cc-sdkroot-smoke" || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary" 2>&1
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/${binary_glob}; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                case "$(basename "$obj")" in
+                  ${object_prefix}*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            head -n 1 "$out_dir/object-candidates.txt"
+          }
+
+          target_line() {
+            local path="$1"
+            local symbol_addr="$2"
+            local out_file="$3"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$path" > "${out_file}.disassembly.txt" 2>&1
+            python3 - "${out_file}.disassembly.txt" "$target_addr" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = pat.match(line)
+                  if m and int(m.group(1), 16) == target:
+                      print(line.rstrip())
+                      raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+          }
+
+          classify_result() {
+            local status="$1"
+            local log="$2"
+            if [ "$status" -eq 0 ]; then
+              printf 'pass'
+            elif grep -Eq 'SIGSEGV|EXC_BAD_ACCESS|signal: 11|Segmentation fault' "$log"; then
+              printf 'sigsegv'
+            elif grep -Eq 'assertion.*failed|panicked at|left:.*right:' "$log"; then
+              printf 'test-failure'
+            else
+              printf 'fail'
+            fi
+          }
+
+          build_log="$out_dir/build.log"
+          run_log="$out_dir/focused-test.log"
+          command_log="$out_dir/build-command-lines.txt"
+          rustflags="-C save-temps ${target_feature_flags}"
+          build_status=0
+          run_status=0
+          result="not-run"
+          final_line="missing"
+          object_line="missing"
+          linked_sdk="missing"
+
+          pushd libcrux-ml-kem >/dev/null
+          cargo +1.78.0 clean >> "$summary" 2>&1
+          DEVELOPER_DIR="${developer_dir}" \
+            SDKROOT="${sdkroot}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --verbose --release --no-run \
+            > "$build_log" 2>&1
+          build_status=$?
+
+          DEVELOPER_DIR="${developer_dir}" \
+            SDKROOT="${sdkroot}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --release "${focused_test}" -- --exact --nocapture \
+            > "$run_log" 2>&1
+          run_status=$?
+          popd >/dev/null
+
+          grep -E 'Running `| -C target_feature=| -C save-temps|SDKROOT|isysroot|platform_version|error:|ld:' "$build_log" \
+            > "$command_log" 2>&1 || true
+
+          result="$(classify_result "$run_status" "$run_log")"
+
+          {
+            echo "## Build and test"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo "- classified result: \`${result}\`"
+            echo "- build log: \`${build_log}\`"
+            echo "- focused test log: \`${run_log}\`"
+            echo "- command extraction: \`${command_log}\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -eq 0 ]; then
+            bin="$(find_test_binary)"
+            obj="$(find_target_object)"
+            if [ -n "$bin" ] && [ -n "$obj" ]; then
+              bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+              final_nm="$out_dir/final.nm.txt"
+              obj_nm="$out_dir/object.nm.txt"
+              macho_file="$out_dir/final.macho-load-commands.txt"
+              nm -nm "$bin_abs" > "$final_nm" 2>&1
+              nm -nm "$obj" > "$obj_nm" 2>&1
+              final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$final_nm")"
+              obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$obj_nm")"
+              otool -l "$bin_abs" > "$macho_file" 2>&1
+              linked_sdk="$(awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' "$macho_file" | tr '\n' ' ' | tr -s ' ' | sed 's/[[:space:]]$//')"
+
+              {
+                echo "## Selected artifacts"
+                echo
+                echo "- selected binary: \`${bin_abs}\`"
+                echo "- selected object: \`${obj}\`"
+                echo "- final target symbol address: \`${final_addr:-missing}\`"
+                echo "- object target symbol address: \`${obj_addr:-missing}\`"
+                echo
+                echo "### Binary metadata"
+                echo
+                echo "\`\`\`text"
+                file "$bin_abs" || true
+                shasum -a 256 "$bin_abs" || true
+                awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' "$macho_file" || true
+                echo "\`\`\`"
+                echo
+              } >> "$summary" 2>&1
+
+              if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line "$bin_abs" "0x${final_addr}" "$out_dir/final.target-line.txt" || true
+                final_line="$(cat "$out_dir/final.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+              if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line "$obj" "0x${obj_addr}" "$out_dir/object.target-line.txt" || true
+                object_line="$(cat "$out_dir/object.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+            fi
+          fi
+
+          {
+            echo "## Target lines"
+            echo
+            echo "\`\`\`text"
+            echo "object: ${object_line}"
+            echo "final:  ${final_line}"
+            echo "\`\`\`"
+            echo
+            echo "## Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 100 "$run_log"
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          developer_version="$(DEVELOPER_DIR="${developer_dir}" xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          printf 'case\tmode\tvariant\tdeveloper_version\tsdkroot\tbuild_status\trun_status\tresult\tobject_line\tfinal_line\tlinked_sdk\n' > "$row_file"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$case_label" "$mode" "$variant" "$developer_version" "$sdkroot" "$build_status" "$run_status" "$result" "$object_line" "$final_line" "$linked_sdk" >> "$row_file"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload Xcode SDK cross diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-sdk-cross-${{ matrix.case.label }}-${{ matrix.mode.label }}-${{ matrix.variant.label }}
+          path: neon-rej-diagnostics/sdk-cross-${{ matrix.case.label }}-${{ matrix.mode.label }}-${{ matrix.variant.label }}
