@@ -1,0 +1,389 @@
+name: NEON rejection sampler public Xcode 0c67 link relocation
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  link-reloc:
+    name: 0c67 link reloc ${{ matrix.xcode_label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Collect focused relocation and raw-instruction evidence
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-link-reloc-${{ matrix.xcode_label }}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          failure=0
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+
+          {
+            echo "# 0c67 link relocation probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target: \`${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objdump || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; cannot run relocation probe." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local mode="$1"
+            local obj nm_file
+            : > "$out_dir/${mode}.object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/${mode}.$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/${mode}.object-candidates.txt"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            head -n 1 "$out_dir/${mode}.object-candidates.txt"
+          }
+
+          extract_address_window() {
+            local in_file="$1"
+            local center_hex="$2"
+            local before_hex="$3"
+            local after_hex="$4"
+            local out_file="$5"
+            python3 - "$in_file" "$center_hex" "$before_hex" "$after_hex" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, center_s, before_s, after_s = sys.argv[1:]
+          center = int(center_s, 16)
+          start = center - int(before_s, 16)
+          stop = center + int(after_s, 16)
+          address_re = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = address_re.match(line)
+                  if not m:
+                      continue
+                  addr = int(m.group(1), 16)
+                  if start <= addr <= stop:
+                      sys.stdout.write(line)
+          PY
+          }
+
+          extract_reloc_window() {
+            local in_file="$1"
+            local center_hex="$2"
+            local before_hex="$3"
+            local after_hex="$4"
+            local out_file="$5"
+            python3 - "$in_file" "$center_hex" "$before_hex" "$after_hex" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, center_s, before_s, after_s = sys.argv[1:]
+          center = int(center_s, 16)
+          start = center - int(before_s, 16)
+          stop = center + int(after_s, 16)
+          hex_re = re.compile(r"\b(?:0x)?([0-9a-fA-F]{4,16})\b")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  for m in hex_re.finditer(line):
+                      addr = int(m.group(1), 16)
+                      if start <= addr <= stop:
+                          sys.stdout.write(line)
+                          break
+          PY
+          }
+
+          collect_file() {
+            local mode="$1"
+            local kind="$2"
+            local path="$3"
+            local symbol_addr="$4"
+            local target_addr
+            local dis="$out_dir/${mode}.${kind}.disassembly.txt"
+            local win="$out_dir/${mode}.${kind}.target-window.txt"
+            local rel_llvm="$out_dir/${mode}.${kind}.llvm-reloc.txt"
+            local rel_otool="$out_dir/${mode}.${kind}.otool-reloc.txt"
+            local rel_win="$out_dir/${mode}.${kind}.reloc-window.txt"
+
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            target_addr="0x${target_addr}"
+
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$path" > "$dis" 2>&1
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --reloc \
+              "$path" > "$rel_llvm" 2>&1
+            otool -rvV "$path" > "$rel_otool" 2>&1
+            extract_address_window "$dis" "$target_addr" 0x80 0x120 "$win"
+            extract_reloc_window "$rel_llvm" "$target_addr" 0x80 0x120 "$rel_win"
+            extract_reloc_window "$rel_otool" "$target_addr" 0x80 0x120 "$out_dir/${mode}.${kind}.otool-reloc-window.txt"
+
+            {
+              echo "### ${mode} ${kind}"
+              echo
+              echo "- path: \`${path}\`"
+              echo "- symbol address: \`0x${symbol_addr#0x}\`"
+              echo "- target address: \`${target_addr}\`"
+              echo
+              echo "#### Target disassembly window"
+              echo
+              echo "\`\`\`text"
+              cat "$win"
+              echo "\`\`\`"
+              echo
+              echo "#### LLVM relocation window"
+              echo
+              echo "\`\`\`text"
+              cat "$rel_win"
+              echo "\`\`\`"
+              echo
+              echo "#### otool relocation window"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.${kind}.otool-reloc-window.txt"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode() {
+            local mode="$1"
+            local build_log="$out_dir/${mode}.build.log"
+            local command_log="$out_dir/${mode}.build-command-lines.txt"
+            local map_file="$out_dir/${mode}.link.map"
+            local build_status bin bin_abs obj obj_nm final_nm obj_addr final_addr rustflags
+
+            {
+              echo
+              echo "## Mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            if [ "$mode" = "ordinary" ]; then
+              rustflags="-C save-temps -C link-arg=-Wl,-map,${map_file}"
+            else
+              rustflags="-C save-temps -C target_feature=+neon -C link-arg=-Wl,-map,${map_file}"
+            fi
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --verbose --release --no-run \
+              > "$build_log" 2>&1
+            build_status=$?
+            popd >/dev/null
+
+            grep -E 'Running `| -C link-arg=| -C target_feature=| -C save-temps| -C linker=| cc | ld ' "$build_log" \
+              > "$command_log" 2>&1 || true
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- RUSTFLAGS: \`${rustflags}\`"
+              echo "- build log: \`${build_log}\`"
+              echo "- command extraction: \`${command_log}\`"
+              echo "- link map: \`${map_file}\`"
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              failure=1
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            obj="$(find_target_object "$mode")"
+            if [ -z "$bin" ] || [ -z "$obj" ]; then
+              echo "- selected binary or target object missing" >> "$summary"
+              failure=1
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+            final_nm="$out_dir/${mode}.final.nm.txt"
+            obj_nm="$out_dir/${mode}.object.nm.txt"
+            nm -nm "$bin_abs" > "$final_nm" 2>&1
+            nm -nm "$obj" > "$obj_nm" 2>&1
+            final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$final_nm")"
+            obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$obj_nm")"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo "- selected object: \`${obj}\`"
+              echo "- final h8997 address: \`${final_addr:-missing}\`"
+              echo "- object h8997 address: \`${obj_addr:-missing}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} target object metadata"
+              echo
+              echo "\`\`\`text"
+              file "$obj" || true
+              shasum -a 256 "$obj" || true
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --section-headers "$obj" || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+
+            if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              collect_file "$mode" final "$bin_abs" "0x${final_addr}"
+            else
+              failure=1
+            fi
+            if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              collect_file "$mode" object "$obj" "0x${obj_addr}"
+            else
+              failure=1
+            fi
+
+            {
+              echo "### ${mode} object candidates"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.object-candidates.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} link map target lines"
+              echo
+              echo "\`\`\`text"
+              grep -n "$target_hash" "$map_file" || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload link relocation diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-link-reloc-${{ matrix.xcode_label }}
+          path: neon-rej-diagnostics/0c67-link-reloc-${{ matrix.xcode_label }}
