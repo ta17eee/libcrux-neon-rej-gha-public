@@ -92,6 +92,7 @@ jobs:
           xcode_label="${{ matrix.xcode_label }}"
           variant="${{ matrix.variant }}"
           extra_rustflags="${{ matrix.extra_rustflags }}"
+          repo_root="$PWD"
           out_dir="$PWD/neon-rej-diagnostics/b9fa-link-map-${xcode_label}-${variant}"
           mkdir -p "$out_dir"
           summary="$out_dir/summary.md"
@@ -144,7 +145,7 @@ jobs:
 
           find_test_binary() {
             local candidate
-            for candidate in target/release/deps/libcrux_ml_kem-*; do
+            for candidate in "$repo_root"/target/release/deps/libcrux_ml_kem-*; do
               if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
                 printf '%s\n' "$candidate"
                 return 0
@@ -162,7 +163,7 @@ jobs:
                 printf '%s\n' "$obj"
                 return 0
               fi
-            done < <(find target/release -type f -name 'libcrux_ml_kem-*.o' -print | sort)
+            done < <(find "$repo_root"/target/release -type f -name 'libcrux_ml_kem-*.o' -print | sort)
             return 1
           }
 
