@@ -9,7 +9,7 @@ env:
 
 jobs:
   x28-provenance:
-    name: 0c67 x28 provenance ${{ matrix.xcode_label }}
+    name: 0c67 x28 provenance ${{ matrix.xcode_label }} ${{ matrix.variant }}
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -17,8 +17,16 @@ jobs:
         include:
           - xcode_label: xcode-15.0.1
             developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
-          - xcode_label: xcode-15.4
-            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: no_pie
+            extra_rustflags: "-C link-arg=-Wl,-no_pie"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
 
     steps:
       - name: Checkout public upstream libcrux
@@ -80,7 +88,9 @@ jobs:
         run: |
           set +e
           developer_dir="${{ matrix.developer_dir }}"
-          out_dir="$PWD/neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}-${variant}"
           mkdir -p "$out_dir"
           summary="$out_dir/summary.md"
           failure=0
@@ -90,6 +100,8 @@ jobs:
             echo
             echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
             echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
             echo "Developer dir: \`${developer_dir}\`"
             echo "Test filter: \`kyber1024_nist_known_answer_tests\`"
             echo 'Probe: stop at `h8997 + 0x2d3c`, step the candidate x28 assignment, then continue through `h8997 + 812` and `h8997 + 7740` events.'
@@ -220,12 +232,13 @@ jobs:
             cargo +1.78.0 clean >> "$summary" 2>&1
             if [ "$mode" = "ordinary" ]; then
               DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="${extra_rustflags}" \
                 cargo +1.78.0 test --verbose --release --no-run \
                 > "$build_log" 2>&1
               build_status=$?
             else
               DEVELOPER_DIR="${developer_dir}" \
-                RUSTFLAGS="-C target_feature=+neon" \
+                RUSTFLAGS="-C target_feature=+neon ${extra_rustflags}" \
                 cargo +1.78.0 test --verbose --release --no-run \
                 > "$build_log" 2>&1
               build_status=$?
@@ -301,6 +314,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: neon-rej-public-xcode-0c67-x28-provenance-${{ matrix.xcode_label }}
-          path: neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}
+          name: neon-rej-public-xcode-0c67-x28-provenance-${{ matrix.xcode_label }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/0c67-x28-provenance-${{ matrix.xcode_label }}-${{ matrix.variant }}
           if-no-files-found: warn
