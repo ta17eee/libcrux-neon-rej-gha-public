@@ -275,10 +275,13 @@ jobs:
           fi
 
           if [ -n "$selected_bin" ]; then
+            selected_bin_abs="$PWD/$selected_bin"
             target_line cargo-final "$selected_bin" "$out_dir/cargo-final.target-line.txt"
             cargo_final_line="$(cat "$out_dir/cargo-final.target-line.txt")"
-            run_with_timeout 180 "$selected_bin" kyber1024_nist_known_answer_tests --exact --nocapture \
-              > "$out_dir/cargo-final-test.log" 2>&1
+            (
+              cd libcrux-ml-kem
+              run_with_timeout 180 "$selected_bin_abs" kyber1024_nist_known_answer_tests --exact --nocapture
+            ) > "$out_dir/cargo-final-test.log" 2>&1
             cargo_run_status=$?
           fi
 
@@ -327,8 +330,10 @@ jobs:
               manual_sha="$(shasum -a 256 "$manual_bin" | awk '{ print $1 }')"
               target_line manual-final "$manual_bin" "$out_dir/manual-final.target-line.txt"
               manual_final_line="$(cat "$out_dir/manual-final.target-line.txt")"
-              run_with_timeout 180 "$manual_bin" kyber1024_nist_known_answer_tests --exact --nocapture \
-                > "$out_dir/manual-final-test.log" 2>&1
+              (
+                cd libcrux-ml-kem
+                run_with_timeout 180 "$manual_bin" kyber1024_nist_known_answer_tests --exact --nocapture
+              ) > "$out_dir/manual-final-test.log" 2>&1
               manual_run_status=$?
             fi
           fi
