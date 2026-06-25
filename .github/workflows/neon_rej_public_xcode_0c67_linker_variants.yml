@@ -1,0 +1,329 @@
+name: NEON rejection sampler public Xcode 0c67 linker variants
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  linker-variant:
+    name: 0c67 linker ${{ matrix.xcode_label }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: no_deduplicate
+            extra_rustflags: "-C link-arg=-Wl,-no_deduplicate"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic_no_deduplicate
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic -C link-arg=-Wl,-no_deduplicate"
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Probe linker variant
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-linker-variants-${{ matrix.xcode_label }}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+
+          {
+            echo "# 0c67 linker variant probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" ld -help 2>&1 | grep -E 'ld_classic|deduplicate|adhoc|subsection|branch|island' || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local mode="$1"
+            local obj nm_file
+            : > "$out_dir/${mode}.object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/${mode}.$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/${mode}.object-candidates.txt"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            head -n 1 "$out_dir/${mode}.object-candidates.txt"
+          }
+
+          target_line() {
+            local path="$1"
+            local symbol_addr="$2"
+            local out_file="$3"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$path" > "${out_file}.disassembly.txt" 2>&1
+            python3 - "${out_file}.disassembly.txt" "$target_addr" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = pat.match(line)
+                  if m and int(m.group(1), 16) == target:
+                      print(line.rstrip())
+                      raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+          }
+
+          build_mode() {
+            local mode="$1"
+            local target_feature_flags=""
+            local build_log="$out_dir/${mode}.build.log"
+            local run_log="$out_dir/${mode}.focused-test.log"
+            local command_log="$out_dir/${mode}.build-command-lines.txt"
+            local map_file="$out_dir/${mode}.link.map"
+            local build_status run_status bin bin_abs obj final_nm obj_nm final_addr obj_addr rustflags
+
+            if [ "$mode" = "plus-neon" ]; then
+              target_feature_flags="-C target_feature=+neon"
+            fi
+            rustflags="-C save-temps ${target_feature_flags} ${extra_rustflags} -C link-arg=-Wl,-map,${map_file}"
+
+            {
+              echo "## Mode: ${mode}"
+              echo
+              echo "- RUSTFLAGS: \`${rustflags}\`"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --verbose --release --no-run \
+              > "$build_log" 2>&1
+            build_status=$?
+
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --release kyber1024_nist_known_answer_tests -- --exact --nocapture \
+              > "$run_log" 2>&1
+            run_status=$?
+            popd >/dev/null
+
+            grep -E 'Running `| -C link-arg=| -C target_feature=| -C save-temps|ld_classic|deduplicate|error:|ld:' "$build_log" \
+              > "$command_log" 2>&1 || true
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- focused KAT exit: \`${run_status}\`"
+              echo "- build log: \`${build_log}\`"
+              echo "- focused KAT log: \`${run_log}\`"
+              echo "- command extraction: \`${command_log}\`"
+              echo
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              {
+                echo "### ${mode} build failure tail"
+                echo
+                echo "\`\`\`text"
+                tail -n 120 "$build_log"
+                echo "\`\`\`"
+                echo
+              } >> "$summary"
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            obj="$(find_target_object "$mode")"
+            if [ -z "$bin" ] || [ -z "$obj" ]; then
+              echo "- selected binary or target object missing" >> "$summary"
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+            final_nm="$out_dir/${mode}.final.nm.txt"
+            obj_nm="$out_dir/${mode}.object.nm.txt"
+            nm -nm "$bin_abs" > "$final_nm" 2>&1
+            nm -nm "$obj" > "$obj_nm" 2>&1
+            final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$final_nm")"
+            obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$obj_nm")"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo "- selected object: \`${obj}\`"
+              echo "- final h8997 address: \`${final_addr:-missing}\`"
+              echo "- object h8997 address: \`${obj_addr:-missing}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              echo "\`\`\`"
+            } >> "$summary" 2>&1
+
+            if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              target_line "$bin_abs" "0x${final_addr}" "$out_dir/${mode}.final.target-line.txt" || true
+            fi
+            if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              target_line "$obj" "0x${obj_addr}" "$out_dir/${mode}.object.target-line.txt" || true
+            fi
+
+            {
+              echo "### ${mode} target lines"
+              echo
+              echo "\`\`\`text"
+              echo "final:"
+              cat "$out_dir/${mode}.final.target-line.txt" 2>/dev/null || true
+              echo "object:"
+              cat "$out_dir/${mode}.object.target-line.txt" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} focused KAT tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$run_log"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload linker variant diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-linker-variants-${{ matrix.xcode_label }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/0c67-linker-variants-${{ matrix.xcode_label }}-${{ matrix.variant }}
