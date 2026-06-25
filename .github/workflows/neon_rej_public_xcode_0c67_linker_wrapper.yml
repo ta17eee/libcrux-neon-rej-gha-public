@@ -18,30 +18,55 @@ jobs:
           - mode: ordinary
             variant: default
             extra_rustflags: ""
+            profile_patch: ""
           - mode: plus-neon
             variant: default
             extra_rustflags: "-C target_feature=+neon"
+            profile_patch: ""
           - mode: ordinary
             variant: ld_classic
             extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+            profile_patch: ""
           - mode: ordinary
             variant: link_dead_code
             extra_rustflags: "-C link-dead-code=yes"
+            profile_patch: ""
           - mode: plus-neon
             variant: link_dead_code
             extra_rustflags: "-C target_feature=+neon -C link-dead-code=yes"
+            profile_patch: ""
           - mode: ordinary
             variant: lto_off
             extra_rustflags: "-C lto=off"
+            profile_patch: ""
           - mode: plus-neon
             variant: lto_off
             extra_rustflags: "-C target_feature=+neon -C lto=off"
+            profile_patch: ""
           - mode: ordinary
             variant: lto_off_cgu16
             extra_rustflags: "-C lto=off -C codegen-units=16"
+            profile_patch: ""
           - mode: plus-neon
             variant: lto_off_cgu16
             extra_rustflags: "-C target_feature=+neon -C lto=off -C codegen-units=16"
+            profile_patch: ""
+          - mode: ordinary
+            variant: profile_lto_off
+            extra_rustflags: ""
+            profile_patch: lto_off
+          - mode: plus-neon
+            variant: profile_lto_off
+            extra_rustflags: "-C target_feature=+neon"
+            profile_patch: lto_off
+          - mode: ordinary
+            variant: profile_lto_off_cgu16
+            extra_rustflags: ""
+            profile_patch: lto_off_cgu16
+          - mode: plus-neon
+            variant: profile_lto_off_cgu16
+            extra_rustflags: "-C target_feature=+neon"
+            profile_patch: lto_off_cgu16
 
     steps:
       - name: Checkout public upstream libcrux
@@ -93,6 +118,7 @@ jobs:
           mode="${{ matrix.mode }}"
           variant="${{ matrix.variant }}"
           extra_rustflags="${{ matrix.extra_rustflags }}"
+          profile_patch="${{ matrix.profile_patch }}"
           target_hash="h8997d6f42564fb09"
           target_offset_hex="0x2d3c"
           out_dir="$PWD/neon-rej-diagnostics/0c67-linker-wrapper-${mode}-${variant}"
@@ -111,6 +137,7 @@ jobs:
             echo "Mode: \`${mode}\`"
             echo "Variant: \`${variant}\`"
             echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Profile patch: \`${profile_patch}\`"
             echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
             echo
             echo "## Runner and toolchain"
@@ -376,6 +403,71 @@ jobs:
               echo
             } >> "$summary"
           }
+
+          if [ -n "$profile_patch" ]; then
+            cp Cargo.toml "$out_dir/Cargo.toml.before-profile-patch"
+            python3 - "$profile_patch" Cargo.toml <<'PY'
+          import re
+          import sys
+
+          patch = sys.argv[1]
+          path = sys.argv[2]
+          with open(path, "r", encoding="utf-8") as f:
+              lines = f.readlines()
+
+          start = None
+          for i, line in enumerate(lines):
+              if line.strip() == "[profile.release]":
+                  start = i
+                  break
+          if start is None:
+              raise SystemExit("missing [profile.release]")
+
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"\s*\[[^\]]+\]\s*$", lines[i]):
+                  end = i
+                  break
+
+          def upsert(key, value):
+              global lines, end
+              needle = re.compile(rf"\s*{re.escape(key)}\s*=")
+              for i in range(start + 1, end):
+                  if needle.match(lines[i]):
+                      lines[i] = f"{key} = {value}\n"
+                      return
+              lines.insert(start + 1, f"{key} = {value}\n")
+              end += 1
+
+          if patch in {"lto_off", "lto_off_cgu16"}:
+              upsert("lto", "false")
+          if patch == "lto_off_cgu16":
+              upsert("codegen-units", "16")
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.writelines(lines)
+          PY
+            cp Cargo.toml "$out_dir/Cargo.toml.after-profile-patch"
+            {
+              echo "## Cargo profile patch"
+              echo
+              echo "\`\`\`text"
+              python3 - <<'PY'
+          import re
+          with open("Cargo.toml", "r", encoding="utf-8") as f:
+              lines = f.readlines()
+          start = next(i for i, line in enumerate(lines) if line.strip() == "[profile.release]")
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"\s*\[[^\]]+\]\s*$", lines[i]):
+                  end = i
+                  break
+          print("".join(lines[start:end]), end="")
+          PY
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          fi
 
           rustflags="-C save-temps -C linker=${wrapper} -C link-arg=-Wl,-map,${map_file} ${extra_rustflags}"
           {
