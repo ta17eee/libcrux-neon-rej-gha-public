@@ -1,0 +1,308 @@
+name: NEON rejection sampler public Xcode b9fa linker variants
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  linker-variant:
+    name: b9fa linker ${{ matrix.xcode_label }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: no_deduplicate
+            extra_rustflags: "-C link-arg=-Wl,-no_deduplicate"
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Probe b9fa linker variant
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          out_dir="$PWD/neon-rej-diagnostics/b9fa-linker-variants-${{ matrix.xcode_label }}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          test_filter="mlkem768::tests::pk_validation"
+
+          {
+            echo "# b9fa linker variant probe"
+            echo
+            echo "Commit: \`b9fa21c6d53dc2b7de2e50d1694af284cb55f769\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Focused test: \`${test_filter}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/libcrux_ml_kem-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          scan_known_bad_bytes() {
+            local root="$1"
+            local out_file="$2"
+            python3 - "$root" > "$out_file" <<'PY'
+          import os
+          import sys
+          root = sys.argv[1]
+          needles = {
+              "ordinary_low_branch_85_f0_c2_17": bytes.fromhex("85 f0 c2 17"),
+              "plus_neon_low_branch_85_c0_c2_17": bytes.fromhex("85 c0 c2 17"),
+          }
+          paths = []
+          if os.path.isfile(root):
+              paths = [root]
+          else:
+              for dirpath, _, filenames in os.walk(root):
+                  for name in filenames:
+                      if name.endswith(".o"):
+                          paths.append(os.path.join(dirpath, name))
+          for path in sorted(paths):
+              try:
+                  data = open(path, "rb").read()
+              except OSError:
+                  continue
+              for label, needle in needles.items():
+                  start = 0
+                  while True:
+                      idx = data.find(needle, start)
+                      if idx < 0:
+                          break
+                      print(f"{label} {path} offset=0x{idx:x}")
+                      start = idx + 1
+          PY
+          }
+
+          build_mode() {
+            local mode="$1"
+            local target_feature_flags=""
+            local build_log="$out_dir/${mode}.build.log"
+            local run_log="$out_dir/${mode}.focused-test.log"
+            local map_file="$out_dir/${mode}.link.map"
+            local rustflags build_status run_status bin bin_abs
+
+            if [ "$mode" = "plus-neon" ]; then
+              target_feature_flags="-C target_feature=+neon"
+            fi
+            rustflags="-C save-temps ${target_feature_flags} ${extra_rustflags} -C link-arg=-Wl,-map,${map_file}"
+
+            {
+              echo "## Mode: ${mode}"
+              echo
+              echo "- RUSTFLAGS: \`${rustflags}\`"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --verbose --release --no-run \
+              > "$build_log" 2>&1
+            build_status=$?
+
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --release "${test_filter}" -- --exact --nocapture \
+              > "$run_log" 2>&1
+            run_status=$?
+            popd >/dev/null
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- focused test exit: \`${run_status}\`"
+              echo "- build log: \`${build_log}\`"
+              echo "- focused test log: \`${run_log}\`"
+              echo
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              {
+                echo "### ${mode} build failure tail"
+                echo
+                echo "\`\`\`text"
+                tail -n 120 "$build_log"
+                echo "\`\`\`"
+                echo
+              } >> "$summary"
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            if [ -z "$bin" ]; then
+              echo "- selected binary: missing" >> "$summary"
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+            nm -nm "$bin_abs" > "$out_dir/${mode}.final.nm.txt" 2>&1
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$bin_abs" > "$out_dir/${mode}.final.disassembly.txt" 2>&1
+            grep -E '\bb[[:space:]]+0xff[0-9a-f]+' "$out_dir/${mode}.final.disassembly.txt" \
+              > "$out_dir/${mode}.final.low-branch-lines.txt" 2>&1 || true
+            grep -E -B10 -A10 '\bb[[:space:]]+0xff[0-9a-f]+' "$out_dir/${mode}.final.disassembly.txt" \
+              > "$out_dir/${mode}.final.low-branch-context.txt" 2>&1 || true
+            scan_known_bad_bytes "$bin_abs" "$out_dir/${mode}.final.bad-byte-scan.txt"
+            scan_known_bad_bytes "target/release" "$out_dir/${mode}.objects.bad-byte-scan.txt"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} final low branch lines"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.low-branch-lines.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} final low branch context"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.low-branch-context.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} known bad byte scan"
+              echo
+              echo "\`\`\`text"
+              echo "final binary:"
+              cat "$out_dir/${mode}.final.bad-byte-scan.txt"
+              echo "objects:"
+              cat "$out_dir/${mode}.objects.bad-byte-scan.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} focused test tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$run_log"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload b9fa linker variant diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-b9fa-linker-variants-${{ matrix.xcode_label }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/b9fa-linker-variants-${{ matrix.xcode_label }}-${{ matrix.variant }}
