@@ -366,6 +366,10 @@ jobs:
             echo "\`\`\`"
           } >> "$summary"
 
+          rm -rf "$out_dir/rlib-members"
+          find "$out_dir" -name '*.disassembly.txt' -delete
+          find "$out_dir" -name '*.nm.txt' -delete
+
           cat "$summary"
           if [ "$build_status" -ne 0 ] || [ "$run_status" -ne 0 ]; then
             exit 1
