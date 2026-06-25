@@ -1,0 +1,352 @@
+name: NEON rejection sampler public Xcode 0c67 object vs link
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  object-vs-link:
+    name: 0c67 object vs link ${{ matrix.xcode_label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+          lldb --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Compare rustc objects with final linked binary
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-object-vs-link-${{ matrix.xcode_label }}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          failure=0
+          target_hash="h8997d6f42564fb09"
+          target_symbol="__ZN14libcrux_ml_kem7ind_cpa16generate_keypair17h8997d6f42564fb09E"
+
+          {
+            echo "# 0c67 object-vs-link probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target symbol hash: \`${target_hash}\`"
+            echo 'Question: does the `h8997 + 0x2d3c` `x28` assignment differ already in rustc object/assembly output, or only after final linking?'
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objdump || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" cc --version || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; cannot run object-vs-link probe." >> "$summary"
+            cat "$summary"
+            exit 1
+          fi
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"0x{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          disassemble_window() {
+            local bin_abs="$1"
+            local start_addr="$2"
+            local mode="$3"
+            local kind="$4"
+            local out_file="$5"
+            local start stop
+            start="$(add_hex "$start_addr" 0x2c80)"
+            stop="$(add_hex "$start_addr" 0x2ec0)"
+
+            {
+              echo "symbol-start=${start_addr}"
+              echo "window=${start}..${stop}"
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+                --macho \
+                --arch=arm64 \
+                --demangle \
+                --no-show-raw-insn \
+                --disassemble \
+                --start-address="${start}" \
+                --stop-address="${stop}" \
+                "$bin_abs" 2>&1
+            } > "$out_file"
+
+            grep -n -E 'orr[[:space:]]+x28|mov[[:space:]]+x28|<\+1157[0-9]>|<\+1158[0-9]>|<\+116[0-9][0-9]>|0x2d3c|b[[:space:]]' \
+              "$out_file" > "$out_dir/${mode}.${kind}.x28-window-hits.txt" 2>&1 || true
+          }
+
+          collect_object_candidates() {
+            local mode="$1"
+            local candidate_list="$out_dir/${mode}.object-candidates.txt"
+            local saved_asm="$out_dir/${mode}.asm-candidates.txt"
+            local object_hits="$out_dir/${mode}.object-x28-hits.txt"
+            local asm_hits="$out_dir/${mode}.asm-x28-hits.txt"
+            : > "$candidate_list"
+            : > "$saved_asm"
+            : > "$object_hits"
+            : > "$asm_hits"
+
+            find target/release -type f \( -name '*.o' -o -name '*.rlib' \) -print | while IFS= read -r obj; do
+              nm -nm "$obj" > "$out_dir/${mode}.$(basename "$obj").nm.txt" 2>&1
+              if grep -q "$target_hash" "$out_dir/${mode}.$(basename "$obj").nm.txt"; then
+                printf '%s\n' "$obj" >> "$candidate_list"
+                local sym_addr
+                sym_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/${mode}.$(basename "$obj").nm.txt")"
+                if printf '%s' "$sym_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                  disassemble_window "$obj" "0x${sym_addr}" "$mode" "object-$(basename "$obj")" "$out_dir/${mode}.object-$(basename "$obj").x28-window.txt"
+                else
+                  DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+                    --macho \
+                    --arch=arm64 \
+                    --demangle \
+                    --no-show-raw-insn \
+                    --disassemble \
+                    "$obj" > "$out_dir/${mode}.object-$(basename "$obj").full-disassembly.txt" 2>&1
+                fi
+              fi
+            done
+
+            find target/release -type f -name '*.s' -print | while IFS= read -r asm; do
+              if grep -q "$target_hash" "$asm"; then
+                printf '%s\n' "$asm" >> "$saved_asm"
+                TARGET_HASH="$target_hash" perl -ne '
+                  push @lines, $_;
+                  if (/$ENV{TARGET_HASH}/ || /orr\s+x28/ || /mov\s+x28/) {
+                    $hit = $.;
+                    for my $i ($hit - 18 .. $hit + 18) { $want{$i} = 1 if $i > 0; }
+                  }
+                  END {
+                    for my $i (sort {$a <=> $b} keys %want) {
+                      print "$i:$lines[$i - 1]" if defined $lines[$i - 1];
+                    }
+                  }
+                ' "$asm" >> "$asm_hits" 2>&1
+              fi
+            done
+
+            for window in "$out_dir"/${mode}.object-*.x28-window.txt "$out_dir"/${mode}.object-*.full-disassembly.txt; do
+              [ -f "$window" ] || continue
+              {
+                echo "===== ${window} ====="
+                grep -n -E "$target_hash|orr[[:space:]]+x28|mov[[:space:]]+x28|<\+1157[0-9]>|<\+1158[0-9]>|<\+116[0-9][0-9]>|0x2d3c|b[[:space:]]" "$window" || true
+              } >> "$object_hits"
+            done
+          }
+
+          build_mode() {
+            local mode="$1"
+            local build_log="$out_dir/${mode}.build-save-temps.log"
+            local commands_log="$out_dir/${mode}.build-command-lines.txt"
+            local bin bin_abs build_status nm_file h8997_addr final_window
+
+            {
+              echo
+              echo "## Mode: ${mode}"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            if [ "$mode" = "ordinary" ]; then
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C save-temps" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            else
+              DEVELOPER_DIR="${developer_dir}" \
+                RUSTFLAGS="-C save-temps -C target_feature=+neon" \
+                cargo +1.78.0 test --verbose --release --no-run \
+                > "$build_log" 2>&1
+              build_status=$?
+            fi
+            popd >/dev/null
+
+            grep -E 'Running `| -C linker=| -C link-arg=| cc | ld ' "$build_log" \
+              > "$commands_log" 2>&1 || true
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- build log: \`${build_log}\`"
+              echo "- command extraction: \`${commands_log}\`"
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              failure=1
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            if [ -z "$bin" ]; then
+              echo "- selected binary: not found" >> "$summary"
+              failure=1
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+            nm_file="$out_dir/${mode}.final.nm-nm.txt"
+            nm -nm "$bin_abs" > "$nm_file" 2>&1
+            h8997_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$nm_file")"
+            final_window="$out_dir/${mode}.final.x28-window.txt"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo "- final h8997 address: \`${h8997_addr:-missing}\`"
+              echo
+              echo "### ${mode} final binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary" 2>&1
+
+            if printf '%s' "$h8997_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              disassemble_window "$bin_abs" "0x${h8997_addr}" "$mode" "final" "$final_window"
+            else
+              echo "Could not find target symbol in final binary." > "$final_window"
+              failure=1
+            fi
+
+            collect_object_candidates "$mode"
+
+            {
+              echo "### ${mode} final x28 window hits"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.x28-window-hits.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} object candidates"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.object-candidates.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} object x28 hits"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.object-x28-hits.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} saved assembly candidates"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.asm-candidates.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} saved assembly x28 hits"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.asm-x28-hits.txt"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload object-vs-link diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-object-vs-link-${{ matrix.xcode_label }}
+          path: neon-rej-diagnostics/0c67-object-vs-link-${{ matrix.xcode_label }}
