@@ -1,0 +1,437 @@
+name: NEON rejection sampler public Xcode b9fa branch provenance
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  branch-provenance:
+    name: b9fa branch provenance ${{ matrix.xcode_label }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_classic
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - xcode_label: xcode-15.4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+            variant: default
+            extra_rustflags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+
+      - name: Runner details
+        run: |
+          sw_vers
+          uname -a
+          sysctl hw.optional.AdvSIMD || true
+          sysctl hw.optional.arm.AdvSIMD || true
+          xcode-select -p || true
+          ls -1d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          rustc --version || true
+          cargo --version || true
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Collect b9fa branch provenance evidence
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.developer_dir }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          out_dir="$PWD/neon-rej-diagnostics/b9fa-branch-provenance-${{ matrix.xcode_label }}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          test_filter="mlkem768::tests::pk_validation"
+          failure=0
+
+          {
+            echo "# b9fa branch provenance probe"
+            echo
+            echo "Commit: \`b9fa21c6d53dc2b7de2e50d1694af284cb55f769\`"
+            echo "Xcode: \`${{ matrix.xcode_label }}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Focused test: \`${test_filter}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objdump || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/libcrux_ml_kem-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          scan_known_bad_bytes() {
+            local root="$1"
+            local out_file="$2"
+            python3 - "$root" > "$out_file" <<'PY'
+          import os
+          import sys
+          root = sys.argv[1]
+          needles = {
+              "ordinary_low_branch_85_f0_c2_17": bytes.fromhex("85 f0 c2 17"),
+              "plus_neon_low_branch_85_c0_c2_17": bytes.fromhex("85 c0 c2 17"),
+          }
+          if os.path.isfile(root):
+              paths = [root]
+          else:
+              paths = []
+              for dirpath, _, filenames in os.walk(root):
+                  for name in filenames:
+                      if name.endswith((".o", ".rlib", ".a")):
+                          paths.append(os.path.join(dirpath, name))
+          for path in sorted(paths):
+              try:
+                  data = open(path, "rb").read()
+              except OSError:
+                  continue
+              for label, needle in needles.items():
+                  start = 0
+                  while True:
+                      idx = data.find(needle, start)
+                      if idx < 0:
+                          break
+                      print(f"{label} {path} offset=0x{idx:x}")
+                      start = idx + 1
+          PY
+          }
+
+          extract_map_context() {
+            local map_file="$1"
+            local branches="$2"
+            local out_file="$3"
+            python3 - "$map_file" "$branches" > "$out_file" <<'PY'
+          import bisect
+          import re
+          import sys
+          map_path, branch_path = sys.argv[1:]
+          addr_re = re.compile(r"\b0x([0-9a-fA-F]{8,16})\b")
+          entries = []
+          try:
+              with open(map_path, "r", errors="replace") as f:
+                  for idx, line in enumerate(f, 1):
+                      m = addr_re.search(line)
+                      if m:
+                          entries.append((int(m.group(1), 16), idx, line.rstrip()))
+          except OSError as e:
+              print(f"cannot read map: {e}")
+              raise SystemExit(0)
+          entries.sort()
+          addrs = [x[0] for x in entries]
+          branch_addrs = []
+          with open(branch_path, "r", errors="replace") as f:
+              for line in f:
+                  m = re.match(r"\s*([0-9a-fA-F]+):", line)
+                  if m:
+                      branch_addrs.append(int(m.group(1), 16))
+          if not branch_addrs:
+              print("(no low branch addresses)")
+              raise SystemExit(0)
+          for addr in branch_addrs:
+              print(f"## branch 0x{addr:x}")
+              pos = bisect.bisect_right(addrs, addr)
+              nearest = entries[pos - 1] if pos > 0 else None
+              for entry in entries[max(0, pos - 8):min(len(entries), pos + 8)]:
+                  mark = " <= nearest-before" if nearest is not None and entry == nearest else ""
+                  print(f"{entry[1]}: {entry[2]}{mark}")
+              print()
+          PY
+          }
+
+          extract_reloc_context() {
+            local reloc_file="$1"
+            local branches="$2"
+            local out_file="$3"
+            python3 - "$reloc_file" "$branches" > "$out_file" <<'PY'
+          import re
+          import sys
+          reloc_path, branch_path = sys.argv[1:]
+          branch_addrs = []
+          with open(branch_path, "r", errors="replace") as f:
+              for line in f:
+                  m = re.match(r"\s*([0-9a-fA-F]+):", line)
+                  if m:
+                      branch_addrs.append(int(m.group(1), 16))
+          if not branch_addrs:
+              print("(no low branch addresses)")
+              raise SystemExit(0)
+          hex_re = re.compile(r"\b(?:0x)?([0-9a-fA-F]{4,16})\b")
+          lines = open(reloc_path, "r", errors="replace").read().splitlines()
+          for branch in branch_addrs:
+              print(f"## branch 0x{branch:x}")
+              found = False
+              for line in lines:
+                  for m in hex_re.finditer(line):
+                      value = int(m.group(1), 16)
+                      if branch - 0x100 <= value <= branch + 0x100:
+                          print(line)
+                          found = True
+                          break
+              if not found:
+                  print("(no relocation lines within +/-0x100)")
+              print()
+          PY
+          }
+
+          extract_rejsample_contexts() {
+            local dis_file="$1"
+            local out_file="$2"
+            python3 - "$dis_file" > "$out_file" <<'PY'
+          import sys
+          lines = open(sys.argv[1], "r", errors="replace").read().splitlines()
+          hit_indices = [i for i, line in enumerate(lines) if "rej_sample" in line]
+          if not hit_indices:
+              print("(no rej_sample references)")
+          for n, i in enumerate(hit_indices, 1):
+              print(f"## rej_sample reference {n} at disassembly line {i + 1}")
+              for line in lines[max(0, i - 12):min(len(lines), i + 34)]:
+                  print(line)
+              print()
+          PY
+          }
+
+          build_mode() {
+            local mode="$1"
+            local target_feature_flags=""
+            local build_log="$out_dir/${mode}.build.log"
+            local run_log="$out_dir/${mode}.focused-test.log"
+            local map_file="$out_dir/${mode}.link.map"
+            local rustflags build_status run_status bin bin_abs
+
+            if [ "$mode" = "plus-neon" ]; then
+              target_feature_flags="-C target_feature=+neon"
+            fi
+            rustflags="-C save-temps ${target_feature_flags} ${extra_rustflags} -C link-arg=-Wl,-map,${map_file}"
+
+            {
+              echo "## Mode: ${mode}"
+              echo
+              echo "- RUSTFLAGS: \`${rustflags}\`"
+              echo
+            } >> "$summary"
+
+            pushd libcrux-ml-kem >/dev/null
+            cargo +1.78.0 clean >> "$summary" 2>&1
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --verbose --release --no-run \
+              > "$build_log" 2>&1
+            build_status=$?
+
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              cargo +1.78.0 test --release "${test_filter}" -- --exact --nocapture \
+              > "$run_log" 2>&1
+            run_status=$?
+            popd >/dev/null
+
+            {
+              echo "- build exit: \`${build_status}\`"
+              echo "- focused test exit: \`${run_status}\`"
+              echo "- build log: \`${build_log}\`"
+              echo "- focused test log: \`${run_log}\`"
+              echo "- link map: \`${map_file}\`"
+              echo
+            } >> "$summary"
+
+            if [ "$build_status" -ne 0 ]; then
+              failure=1
+              {
+                echo "### ${mode} build failure tail"
+                echo
+                echo "\`\`\`text"
+                tail -n 120 "$build_log"
+                echo "\`\`\`"
+                echo
+              } >> "$summary"
+              return
+            fi
+
+            bin="$(find_test_binary)"
+            if [ -z "$bin" ]; then
+              echo "- selected binary: missing" >> "$summary"
+              failure=1
+              return
+            fi
+            bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+            nm -nm "$bin_abs" > "$out_dir/${mode}.final.nm.txt" 2>&1
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$bin_abs" > "$out_dir/${mode}.final.disassembly.txt" 2>&1
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --reloc \
+              "$bin_abs" > "$out_dir/${mode}.final.llvm-reloc.txt" 2>&1
+            otool -rvV "$bin_abs" > "$out_dir/${mode}.final.otool-reloc.txt" 2>&1
+
+            grep -E '\bb[[:space:]]+0xff[0-9a-f]+' "$out_dir/${mode}.final.disassembly.txt" \
+              > "$out_dir/${mode}.final.low-branch-lines.txt" 2>&1 || true
+            grep -E -B12 -A24 '\bb[[:space:]]+0xff[0-9a-f]+' "$out_dir/${mode}.final.disassembly.txt" \
+              > "$out_dir/${mode}.final.low-branch-context.txt" 2>&1 || true
+            extract_rejsample_contexts "$out_dir/${mode}.final.disassembly.txt" "$out_dir/${mode}.final.rejsample-contexts.txt"
+            extract_map_context "$map_file" "$out_dir/${mode}.final.low-branch-lines.txt" "$out_dir/${mode}.link-map.low-branch-context.txt"
+            extract_reloc_context "$out_dir/${mode}.final.llvm-reloc.txt" "$out_dir/${mode}.final.low-branch-lines.txt" "$out_dir/${mode}.final.llvm-reloc.low-branch-context.txt"
+            extract_reloc_context "$out_dir/${mode}.final.otool-reloc.txt" "$out_dir/${mode}.final.low-branch-lines.txt" "$out_dir/${mode}.final.otool-reloc.low-branch-context.txt"
+            scan_known_bad_bytes "$bin_abs" "$out_dir/${mode}.final.bad-byte-scan.txt"
+            scan_known_bad_bytes "target/release" "$out_dir/${mode}.objects.bad-byte-scan.txt"
+
+            {
+              echo "- selected binary: \`${bin_abs}\`"
+              echo
+              echo "### ${mode} binary metadata"
+              echo
+              echo "\`\`\`text"
+              file "$bin_abs" || true
+              shasum -a 256 "$bin_abs" || true
+              otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} final low branch lines"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.low-branch-lines.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} final low branch context"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.low-branch-context.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} link map context for low branches"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.link-map.low-branch-context.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} final relocation context for low branches"
+              echo
+              echo "\`\`\`text"
+              echo "llvm-objdump:"
+              cat "$out_dir/${mode}.final.llvm-reloc.low-branch-context.txt"
+              echo
+              echo "otool:"
+              cat "$out_dir/${mode}.final.otool-reloc.low-branch-context.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} known bad byte scan"
+              echo
+              echo "\`\`\`text"
+              echo "final binary:"
+              cat "$out_dir/${mode}.final.bad-byte-scan.txt"
+              echo "objects / archives:"
+              cat "$out_dir/${mode}.objects.bad-byte-scan.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} post-rejsample contexts"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${mode}.final.rejsample-contexts.txt"
+              echo "\`\`\`"
+              echo
+              echo "### ${mode} focused test tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$run_log"
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          }
+
+          build_mode ordinary
+          build_mode plus-neon
+
+          cat "$summary"
+          exit "$failure"
+
+      - name: Upload b9fa branch provenance diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-b9fa-branch-provenance-${{ matrix.xcode_label }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/b9fa-branch-provenance-${{ matrix.xcode_label }}-${{ matrix.variant }}
