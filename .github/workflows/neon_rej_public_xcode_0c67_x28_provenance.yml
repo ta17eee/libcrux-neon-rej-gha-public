@@ -266,9 +266,12 @@ jobs:
 
             cmd_file="$(make_lldb_commands "$mode" "$bin_abs")"
             lldb_log="$out_dir/${mode}.x28-provenance-lldb.log"
+
+            pushd libcrux-ml-kem >/dev/null
             DEVELOPER_DIR="${developer_dir}" \
               run_with_timeout 240 "$lldb_log" lldb -b -s "$cmd_file" "$bin_abs"
             lldb_status=$?
+            popd >/dev/null
 
             {
               echo "- lldb exit: \`${lldb_status}\`"
