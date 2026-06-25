@@ -1,0 +1,402 @@
+name: NEON rejection sampler public Xcode 0c67 profile LTO variants
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  profile-lto-variants:
+    name: 0c67 profile LTO ${{ matrix.mode }} ${{ matrix.variant }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: ordinary
+            variant: profile_lto_fat
+            extra_rustflags: ""
+            lto_literal: '"fat"'
+            codegen_units: "1"
+          - mode: plus-neon
+            variant: profile_lto_fat
+            extra_rustflags: "-C target_feature=+neon"
+            lto_literal: '"fat"'
+            codegen_units: "1"
+          - mode: ordinary
+            variant: profile_lto_thin
+            extra_rustflags: ""
+            lto_literal: '"thin"'
+            codegen_units: "1"
+          - mode: plus-neon
+            variant: profile_lto_thin
+            extra_rustflags: "-C target_feature=+neon"
+            lto_literal: '"thin"'
+            codegen_units: "1"
+          - mode: ordinary
+            variant: profile_lto_off
+            extra_rustflags: ""
+            lto_literal: "false"
+            codegen_units: "1"
+          - mode: plus-neon
+            variant: profile_lto_off
+            extra_rustflags: "-C target_feature=+neon"
+            lto_literal: "false"
+            codegen_units: "1"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build and inspect profile LTO variant
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode }}"
+          variant="${{ matrix.variant }}"
+          extra_rustflags="${{ matrix.extra_rustflags }}"
+          lto_literal="${{ matrix.lto_literal }}"
+          codegen_units="${{ matrix.codegen_units }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-profile-lto-${mode}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          map_file="$out_dir/nistkats.link.map"
+          wrapper="$PWD/linker-wrapper.sh"
+
+          {
+            echo "# 0c67 profile LTO variant probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Xcode: \`xcode-15.0.1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Profile patch: \`lto = ${lto_literal}, codegen-units = ${codegen_units}\`"
+            echo "Fat-LTO reference target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            echo "Selected Xcode is absent; probe skipped." >> "$summary"
+            cat "$summary"
+            exit 0
+          fi
+
+          python3 - "$lto_literal" "$codegen_units" Cargo.toml <<'PY'
+          import re
+          import sys
+
+          lto_literal, codegen_units, path = sys.argv[1:]
+          lines = open(path, encoding="utf-8").read().splitlines(True)
+          start = next(i for i, line in enumerate(lines) if line.strip() == "[profile.release]")
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if re.match(r"\s*\[[^\]]+\]\s*$", lines[i]):
+                  end = i
+                  break
+
+          def upsert(key, value):
+              global end
+              needle = re.compile(rf"\s*{re.escape(key)}\s*=")
+              for i in range(start + 1, end):
+                  if needle.match(lines[i]):
+                      lines[i] = f"{key} = {value}\n"
+                      return
+              lines.insert(start + 1, f"{key} = {value}\n")
+              end += 1
+
+          upsert("lto", lto_literal)
+          upsert("codegen-units", codegen_units)
+          open(path, "w", encoding="utf-8").writelines(lines)
+          PY
+          cp Cargo.toml "$out_dir/Cargo.toml.after-profile-patch"
+
+          cat > "$wrapper" <<'SH'
+          #!/bin/bash
+          set +e
+          out_dir="${LINKER_WRAPPER_OUT_DIR:-.}"
+          mkdir -p "$out_dir"
+          argv_log="$out_dir/linker-wrapper-argv.$$.log"
+          dash_log="$out_dir/linker-wrapper-cc-dash.$$.log"
+          {
+            echo "=== invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            i=0
+            for arg in "$@"; do
+              printf 'arg[%d]=%q\n' "$i" "$arg"
+              i=$((i + 1))
+            done
+            echo
+          } >> "$argv_log" 2>&1
+          {
+            echo "=== cc -### invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            xcrun cc -### "$@"
+            echo "cc_dash_status=$?"
+            echo
+          } >> "$dash_log" 2>&1
+          exec xcrun cc "$@"
+          SH
+          chmod +x "$wrapper"
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                if [ -z "$first_match" ]; then
+                  first_match="$obj"
+                fi
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            if [ -n "$first_match" ]; then
+              printf '%s\n' "$first_match"
+              return 0
+            fi
+            return 1
+          }
+
+          extract_target_word() {
+            local kind="$1"
+            local path="$2"
+            local out_prefix="$out_dir/${kind}"
+            nm -nm "$path" > "${out_prefix}.nm.txt" 2>&1
+            grep 'generate_keypair17' "${out_prefix}.nm.txt" > "${out_prefix}.generate-keypair-symbols.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "${out_prefix}.disassembly.txt" 2>&1
+            python3 - "${out_prefix}.nm.txt" "${out_prefix}.disassembly.txt" "$target_hash" "$target_offset_hex" "${out_prefix}.target-word.txt" <<'PY'
+          import re
+          import sys
+
+          nm_path, dis_path, target_hash, offset_s, out_path = sys.argv[1:]
+          offset = int(offset_s, 16)
+          sym_re = re.compile(r"^([0-9a-fA-F]+)\s+.*generate_keypair17" + re.escape(target_hash))
+          addr_re = re.compile(r"^\s*([0-9a-fA-F]+):")
+          sym_addr = None
+          for line in open(nm_path, errors="replace"):
+              m = sym_re.match(line)
+              if m:
+                  sym_addr = int(m.group(1), 16)
+                  break
+          with open(out_path, "w") as out:
+              if sym_addr is None:
+                  out.write(f"target symbol h{target_hash} not found\n")
+                  sys.exit(0)
+              target = sym_addr + offset
+              out.write(f"symbol_address=0x{sym_addr:x}\n")
+              out.write(f"target_address=0x{target:x}\n")
+              lines = open(dis_path, errors="replace").read().splitlines()
+              for line in lines:
+                  m = addr_re.match(line)
+                  if not m:
+                      continue
+                  addr = int(m.group(1), 16)
+                  if target - 0x40 <= addr <= target + 0x40:
+                      out.write(line + "\n")
+          PY
+          }
+
+          rustflags="-C save-temps -C linker=${wrapper} -C link-arg=-Wl,-map,${map_file} ${extra_rustflags}"
+          {
+            echo "## Cargo profile patch"
+            echo
+            echo "\`\`\`text"
+            sed -n '/^\[profile.release\]/,/^\[/p' Cargo.toml | sed '$ { /^\\[/ d; }'
+            echo "\`\`\`"
+            echo
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- map file: \`${map_file}\`"
+            echo
+          } >> "$summary"
+
+          export LINKER_WRAPPER_OUT_DIR="$out_dir"
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+          grep -E 'Running `| -C embed-bitcode| -C linker-plugin-lto| -C codegen-units| -C lto| -C link-arg=| -C target_feature=| -C save-temps| -C linker=| -map,' "$out_dir/build.log" \
+            > "$out_dir/build-command-lines.txt" 2>&1 || true
+
+          if [ "$build_status" -eq 0 ]; then
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              run_with_timeout 180 \
+              cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --release --test nistkats kyber1024_nist_known_answer_tests -- --exact --nocapture \
+              > "$out_dir/focused-test.log" 2>&1
+            run_status=$?
+          else
+            run_status=125
+            : > "$out_dir/focused-test.log"
+          fi
+
+          bin="$(find_test_binary)"
+          obj="$(find_target_object)"
+          if [ -n "$bin" ]; then
+            extract_target_word final "$bin"
+          fi
+          if [ -n "$obj" ]; then
+            extract_target_word object "$obj"
+          fi
+
+          rlib="$(ls target/release/deps/liblibcrux_ml_kem-*.rlib 2>/dev/null | head -n 1)"
+          if [ -n "$rlib" ]; then
+            echo "$rlib" > "$out_dir/libcrux_ml_kem.rlib.path.txt"
+          fi
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo "- selected binary: \`${bin:-missing}\`"
+            echo "- selected target object: \`${obj:-missing}\`"
+            echo "- libcrux_ml_kem rlib: \`${rlib:-missing}\`"
+            echo
+            echo "## Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 80 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+            echo
+            echo "## Final target word"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/final.target-word.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Object target word"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object.target-word.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Final generate_keypair symbols"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/final.generate-keypair-symbols.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Linker argv final nistkats excerpt"
+            echo
+            echo "\`\`\`text"
+            grep -nE 'target/release/deps/nistkats-|liblibcrux_ml_kem|dead_strip|-map|platform_version|syslibroot|lto_library' \
+              "$out_dir"/linker-wrapper-argv.*.log "$out_dir"/linker-wrapper-cc-dash.*.log | tail -n 200 || true
+            echo "\`\`\`"
+          } >> "$summary"
+
+          find "$out_dir" -name '*.disassembly.txt' -delete
+          find "$out_dir" -name '*.nm.txt' -delete
+
+          cat "$summary"
+          if [ "$build_status" -ne 0 ] || [ "$run_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload profile LTO variant diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-profile-lto-${{ matrix.mode }}-${{ matrix.variant }}
+          path: neon-rej-diagnostics/0c67-profile-lto-${{ matrix.mode }}-${{ matrix.variant }}
+          if-no-files-found: warn
