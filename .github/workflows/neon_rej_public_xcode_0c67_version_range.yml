@@ -1,0 +1,356 @@
+name: NEON rejection sampler public Xcode 0c67 version range
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  xcode-version-range:
+    name: 0c67 ${{ matrix.mode }} ${{ matrix.xcode_label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: ordinary
+            target_feature_flags: ""
+            xcode_label: xcode15_0_1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+          - mode: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+            xcode_label: xcode15_0_1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+          - mode: ordinary
+            target_feature_flags: ""
+            xcode_label: xcode15_1
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+          - mode: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+            xcode_label: xcode15_1
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+          - mode: ordinary
+            target_feature_flags: ""
+            xcode_label: xcode15_2
+            developer_dir: /Applications/Xcode_15.2.app/Contents/Developer
+          - mode: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+            xcode_label: xcode15_2
+            developer_dir: /Applications/Xcode_15.2.app/Contents/Developer
+          - mode: ordinary
+            target_feature_flags: ""
+            xcode_label: xcode15_3
+            developer_dir: /Applications/Xcode_15.3.app/Contents/Developer
+          - mode: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+            xcode_label: xcode15_3
+            developer_dir: /Applications/Xcode_15.3.app/Contents/Developer
+          - mode: ordinary
+            target_feature_flags: ""
+            xcode_label: xcode15_4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+          - mode: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+            xcode_label: xcode15_4
+            developer_dir: /Applications/Xcode_15.4.app/Contents/Developer
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Probe selected Xcode version
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          mode="${{ matrix.mode }}"
+          xcode_label="${{ matrix.xcode_label }}"
+          developer_dir="${{ matrix.developer_dir }}"
+          target_feature_flags="${{ matrix.target_feature_flags }}"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-xcode-version-range-${mode}-${xcode_label}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          row_file="$out_dir/summary.row.tsv"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+
+          {
+            echo "# 0c67 Xcode version range probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Xcode label: \`${xcode_label}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Reference symbol: \`${target_hash}\`"
+            echo "Reference offset: \`${target_offset_hex}\`"
+            echo
+            echo "## Runner"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            xcode-select -p || true
+            ls -1d /Applications/Xcode*.app 2>/dev/null || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            {
+              echo "Selected Xcode is absent; probe skipped."
+              echo
+            } >> "$summary"
+            printf 'mode\txcode_label\txcode_version\tbuild_status\trun_status\tresult\tobject_line\tfinal_line\n' > "$row_file"
+            printf '%s\t%s\tabsent\tNA\tNA\tskipped\tNA\tNA\n' "$mode" "$xcode_label" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          {
+            echo "## Selected toolchain"
+            echo
+            echo "\`\`\`text"
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --sdk macosx --show-sdk-path || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary" 2>&1
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            head -n 1 "$out_dir/object-candidates.txt"
+          }
+
+          target_line() {
+            local path="$1"
+            local symbol_addr="$2"
+            local out_file="$3"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho \
+              --arch=arm64 \
+              --demangle \
+              --disassemble \
+              "$path" > "${out_file}.disassembly.txt" 2>&1
+            python3 - "${out_file}.disassembly.txt" "$target_addr" > "$out_file" <<'PY'
+          import re
+          import sys
+          path, target_s = sys.argv[1:]
+          target = int(target_s, 16)
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          with open(path, "r", errors="replace") as f:
+              for line in f:
+                  m = pat.match(line)
+                  if m and int(m.group(1), 16) == target:
+                      print(line.rstrip())
+                      raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+          }
+
+          classify_result() {
+            local status="$1"
+            local log="$2"
+            if [ "$status" -eq 0 ]; then
+              printf 'pass'
+            elif grep -Eq 'SIGSEGV|EXC_BAD_ACCESS|signal: 11|Segmentation fault' "$log"; then
+              printf 'sigsegv'
+            elif grep -Eq 'assertion.*failed|panicked at|left:.*right:' "$log"; then
+              printf 'kat-failure'
+            else
+              printf 'fail'
+            fi
+          }
+
+          build_log="$out_dir/build.log"
+          run_log="$out_dir/focused-test.log"
+          command_log="$out_dir/build-command-lines.txt"
+          rustflags="-C save-temps ${target_feature_flags}"
+          build_status=0
+          run_status=0
+          result="not-run"
+          final_line="missing"
+          object_line="missing"
+
+          pushd libcrux-ml-kem >/dev/null
+          cargo +1.78.0 clean >> "$summary" 2>&1
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --verbose --release --no-run \
+            > "$build_log" 2>&1
+          build_status=$?
+
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --release kyber1024_nist_known_answer_tests -- --exact --nocapture \
+            > "$run_log" 2>&1
+          run_status=$?
+          popd >/dev/null
+
+          grep -E 'Running `| -C target_feature=| -C save-temps|error:|ld:' "$build_log" \
+            > "$command_log" 2>&1 || true
+
+          result="$(classify_result "$run_status" "$run_log")"
+
+          {
+            echo "## Build and test"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused KAT exit: \`${run_status}\`"
+            echo "- classified result: \`${result}\`"
+            echo "- build log: \`${build_log}\`"
+            echo "- focused KAT log: \`${run_log}\`"
+            echo "- command extraction: \`${command_log}\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -eq 0 ]; then
+            bin="$(find_test_binary)"
+            obj="$(find_target_object)"
+            if [ -n "$bin" ] && [ -n "$obj" ]; then
+              bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+              final_nm="$out_dir/final.nm.txt"
+              obj_nm="$out_dir/object.nm.txt"
+              nm -nm "$bin_abs" > "$final_nm" 2>&1
+              nm -nm "$obj" > "$obj_nm" 2>&1
+              final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$final_nm")"
+              obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$obj_nm")"
+
+              {
+                echo "## Selected artifacts"
+                echo
+                echo "- selected binary: \`${bin_abs}\`"
+                echo "- selected object: \`${obj}\`"
+                echo "- final h8997 address: \`${final_addr:-missing}\`"
+                echo "- object h8997 address: \`${obj_addr:-missing}\`"
+                echo
+                echo "### Binary metadata"
+                echo
+                echo "\`\`\`text"
+                file "$bin_abs" || true
+                shasum -a 256 "$bin_abs" || true
+                otool -l "$bin_abs" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{p=1} p{print} p && /ntools/{p=0}' || true
+                echo "\`\`\`"
+                echo
+              } >> "$summary" 2>&1
+
+              if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line "$bin_abs" "0x${final_addr}" "$out_dir/final.target-line.txt" || true
+                final_line="$(cat "$out_dir/final.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+              if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line "$obj" "0x${obj_addr}" "$out_dir/object.target-line.txt" || true
+                object_line="$(cat "$out_dir/object.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+            fi
+          fi
+
+          {
+            echo "## Target lines"
+            echo
+            echo "\`\`\`text"
+            echo "object: ${object_line}"
+            echo "final:  ${final_line}"
+            echo "\`\`\`"
+            echo
+            echo "## Focused KAT tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 100 "$run_log"
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          xcode_version="$(DEVELOPER_DIR="${developer_dir}" xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          printf 'mode\txcode_label\txcode_version\tbuild_status\trun_status\tresult\tobject_line\tfinal_line\n' > "$row_file"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$mode" "$xcode_label" "$xcode_version" "$build_status" "$run_status" "$result" "$object_line" "$final_line" >> "$row_file"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload Xcode version range diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-version-range-${{ matrix.mode }}-${{ matrix.xcode_label }}
+          path: neon-rej-diagnostics/0c67-xcode-version-range-${{ matrix.mode }}-${{ matrix.xcode_label }}
