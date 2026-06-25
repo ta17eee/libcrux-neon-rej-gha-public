@@ -25,6 +25,22 @@ jobs:
             extra_rustflags: "-C link-arg=-Wl,-no_pie"
           - xcode_label: xcode-15.0.1
             developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_new
+            extra_rustflags: "-C link-arg=-Wl,-ld_new"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: ld_O0
+            extra_rustflags: "-C link-arg=-Wl,-O0"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: no_branch_islands
+            extra_rustflags: "-C link-arg=-Wl,-no_branch_islands"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            variant: no_function_starts
+            extra_rustflags: "-C link-arg=-Wl,-no_function_starts"
+          - xcode_label: xcode-15.0.1
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
             variant: ld_classic
             extra_rustflags: "-C link-arg=-Wl,-ld_classic"
 
