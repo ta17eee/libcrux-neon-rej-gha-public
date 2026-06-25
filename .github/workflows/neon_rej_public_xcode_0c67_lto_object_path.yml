@@ -1,0 +1,461 @@
+name: NEON rejection sampler public Xcode 0c67 LTO object path
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  lto-object-path:
+    name: 0c67 lto-object ${{ matrix.mode.label }} ${{ matrix.variant.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+        variant:
+          - label: xcode15_0_1_default
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            extra_rustflags: ""
+          - label: xcode15_0_1_ld_classic
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+          - label: xcode15_1_default
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+            extra_rustflags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Capture LTO object path and target word evidence
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.variant.developer_dir }}"
+          mode="${{ matrix.mode.label }}"
+          variant="${{ matrix.variant.label }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          extra_rustflags="${{ matrix.variant.extra_rustflags }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-lto-object-path-${mode}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          row_file="$out_dir/summary.row.tsv"
+          map_file="$out_dir/nistkats.link.map"
+          lto_object="$out_dir/nistkats.object_path_lto.o"
+          wrapper="$PWD/linker-wrapper-lto-object-path.sh"
+
+          {
+            echo "# 0c67 LTO object path probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo "LTO object path: \`${lto_object}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            if [ -d "${developer_dir}" ]; then
+              DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+              DEVELOPER_DIR="${developer_dir}" ld -v || true
+              DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            else
+              echo "selected developer dir absent"
+            fi
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf 'mode\tvariant\tbuild_status\trun_status\tresult\tobject_line\tlto_line\tfinal_line\tlto_file\n' > "$row_file"
+            printf '%s\t%s\tNA\tNA\tskipped\tNA\tNA\tNA\tabsent\n' "$mode" "$variant" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          cat > "$wrapper" <<'SH'
+          #!/bin/bash
+          set +e
+          out_dir="${LINKER_WRAPPER_OUT_DIR:-.}"
+          map_file="${LINKER_WRAPPER_MAP_FILE:-}"
+          lto_object="${LINKER_WRAPPER_LTO_OBJECT:-}"
+          mkdir -p "$out_dir"
+          argv_log="$out_dir/linker-wrapper-argv.$$.log"
+          dash_log="$out_dir/linker-wrapper-cc-dash.$$.log"
+          out_path=""
+          prev=""
+          for arg in "$@"; do
+            if [ "$prev" = "-o" ]; then
+              out_path="$arg"
+              break
+            fi
+            prev="$arg"
+          done
+          extra=()
+          case "$(basename "$out_path")" in
+            nistkats-*)
+              [ -n "$map_file" ] && extra+=("-Wl,-map,${map_file}")
+              [ -n "$lto_object" ] && extra+=("-Wl,-object_path_lto,${lto_object}")
+              ;;
+          esac
+
+          {
+            echo "=== invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            echo "pwd=$(pwd)"
+            echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+            echo "out_path=${out_path}"
+            i=0
+            for arg in "$@"; do
+              printf 'arg[%d]=%q\n' "$i" "$arg"
+              i=$((i + 1))
+            done
+            for arg in "${extra[@]}"; do
+              printf 'extra[%d]=%q\n' "$i" "$arg"
+              i=$((i + 1))
+            done
+            echo
+          } >> "$argv_log" 2>&1
+
+          {
+            echo "=== cc -### invocation $(date -u '+%Y-%m-%dT%H:%M:%SZ') pid=$$ ==="
+            xcrun cc -### "$@" "${extra[@]}"
+            echo "cc_dash_status=$?"
+            echo
+          } >> "$dash_log" 2>&1
+
+          exec xcrun cc "$@" "${extra[@]}"
+          SH
+          chmod +x "$wrapper"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local symbol_addr="$3"
+            local out_file="$4"
+            local target_addr
+            target_addr="$(add_hex "0x${symbol_addr#0x}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$out_dir/${kind}.disassembly.txt" 2>&1
+            python3 - "$out_dir/${kind}.disassembly.txt" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          start = target - 0x40
+          stop = target + 0x80
+          pat = re.compile(r"^\s*([0-9a-fA-F]+):")
+          target_line = ""
+          with open(path, "r", errors="replace") as f, open(out + ".window", "w") as g:
+              for line in f:
+                  m = pat.match(line)
+                  if not m:
+                      continue
+                  addr = int(m.group(1), 16)
+                  if addr == target:
+                      target_line = line.rstrip()
+                  if start <= addr <= stop:
+                      g.write(line)
+          with open(out, "w") as g:
+              g.write(target_line + "\n")
+          raise SystemExit(0 if target_line else 1)
+          PY
+          }
+
+          classify_result() {
+            local status="$1"
+            local log="$2"
+            if [ "$status" -eq 0 ]; then
+              printf 'pass'
+            elif grep -Eq 'SIGSEGV|EXC_BAD_ACCESS|signal: 11|Segmentation fault' "$log"; then
+              printf 'sigsegv'
+            elif grep -Eq 'SIGBUS|signal: 10|Bus error' "$log"; then
+              printf 'sigbus'
+            elif grep -Eq 'assertion.*failed|panicked at|left:.*right:' "$log"; then
+              printf 'test-failure'
+            elif [ "$status" -eq 124 ]; then
+              printf 'timeout'
+            else
+              printf 'fail'
+            fi
+          }
+
+          rustflags="-C save-temps -C linker=${wrapper} ${target_feature_flags} ${extra_rustflags}"
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${rustflags}\`"
+            echo "- wrapper: \`${wrapper}\`"
+            echo
+          } >> "$summary"
+
+          export LINKER_WRAPPER_OUT_DIR="$out_dir"
+          export LINKER_WRAPPER_MAP_FILE="$map_file"
+          export LINKER_WRAPPER_LTO_OBJECT="$lto_object"
+
+          DEVELOPER_DIR="${developer_dir}" \
+            RUSTFLAGS="${rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          if [ "$build_status" -eq 0 ]; then
+            DEVELOPER_DIR="${developer_dir}" \
+              RUSTFLAGS="${rustflags}" \
+              run_with_timeout 180 \
+              cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml --release --test nistkats kyber1024_nist_known_answer_tests -- --exact --nocapture \
+              > "$out_dir/focused-test.log" 2>&1
+            run_status=$?
+          else
+            run_status=125
+            : > "$out_dir/focused-test.log"
+          fi
+          result="$(classify_result "$run_status" "$out_dir/focused-test.log")"
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- focused test exit: \`${run_status}\`"
+            echo "- result: \`${result}\`"
+            echo
+            echo "## Linker wrapper excerpts"
+            echo
+            echo "### argv"
+            echo
+            echo "\`\`\`text"
+            grep -nE 'out_path=|nistkats|object_path_lto|ld_classic|-map|extra\\[' "$out_dir"/linker-wrapper-argv.*.log | head -n 240 || true
+            echo "\`\`\`"
+            echo
+            echo "### cc -###"
+            echo
+            echo "\`\`\`text"
+            grep -nE 'ld|object_path_lto|ld_classic|-map|nistkats|libLTO|platform_version|syslibroot' "$out_dir"/linker-wrapper-cc-dash.*.log | head -n 260 || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          object_line="missing"
+          lto_line="missing"
+          final_line="missing"
+          lto_file_status="missing"
+
+          if [ "$build_status" -eq 0 ]; then
+            bin="$(find_test_binary)"
+            obj="$(find_target_object)"
+            if [ -n "$bin" ] && [ -n "$obj" ]; then
+              bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+              nm -nm "$bin_abs" > "$out_dir/final.nm.txt" 2>&1
+              nm -nm "$obj" > "$out_dir/object.nm.txt" 2>&1
+              final_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/final.nm.txt")"
+              obj_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/object.nm.txt")"
+
+              if printf '%s' "$final_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line final "$bin_abs" "0x${final_addr}" "$out_dir/final.target-line.txt" || true
+                final_line="$(cat "$out_dir/final.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+              if printf '%s' "$obj_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+                target_line object "$obj" "0x${obj_addr}" "$out_dir/object.target-line.txt" || true
+                object_line="$(cat "$out_dir/object.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+              fi
+
+              {
+                echo "## Selected final/object artifacts"
+                echo
+                echo "- selected binary: \`${bin_abs}\`"
+                echo "- selected object: \`${obj}\`"
+                echo "- final symbol address: \`${final_addr:-missing}\`"
+                echo "- object symbol address: \`${obj_addr:-missing}\`"
+                echo
+                echo "### Final target window"
+                echo
+                echo "\`\`\`text"
+                cat "$out_dir/final.target-line.txt.window" 2>/dev/null || true
+                echo "\`\`\`"
+                echo
+                echo "### Object target window"
+                echo
+                echo "\`\`\`text"
+                cat "$out_dir/object.target-line.txt.window" 2>/dev/null || true
+                echo "\`\`\`"
+                echo
+              } >> "$summary"
+            fi
+          fi
+
+          if [ -e "$lto_object" ]; then
+            lto_file_status="$(file "$lto_object" 2>/dev/null || true)"
+            nm -nm "$lto_object" > "$out_dir/lto.nm.txt" 2>&1 || true
+            lto_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/lto.nm.txt")"
+            if printf '%s' "$lto_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              target_line lto "$lto_object" "0x${lto_addr}" "$out_dir/lto.target-line.txt" || true
+              lto_line="$(cat "$out_dir/lto.target-line.txt" 2>/dev/null | tr '\t' ' ' | tr -s ' ' || true)"
+            else
+              lto_line="symbol-missing"
+            fi
+            {
+              echo "## LTO object path artifact"
+              echo
+              echo "- file: \`${lto_file_status}\`"
+              echo "- symbol address: \`${lto_addr:-missing}\`"
+              echo "- target line: \`${lto_line}\`"
+              echo
+              echo "### LTO object target window"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/lto.target-line.txt.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+          else
+            echo "## LTO object path artifact" >> "$summary"
+            echo >> "$summary"
+            echo "LTO object file was not created." >> "$summary"
+            echo >> "$summary"
+          fi
+
+          {
+            echo "## Focused test tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 100 "$out_dir/focused-test.log"
+            echo "\`\`\`"
+            echo
+            echo "## Target line summary"
+            echo
+            echo "\`\`\`text"
+            echo "object: ${object_line}"
+            echo "lto:    ${lto_line}"
+            echo "final:  ${final_line}"
+            echo "\`\`\`"
+          } >> "$summary"
+
+          printf 'mode\tvariant\tbuild_status\trun_status\tresult\tobject_line\tlto_line\tfinal_line\tlto_file\n' > "$row_file"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$mode" "$variant" "$build_status" "$run_status" "$result" \
+            "$object_line" "$lto_line" "$final_line" "$lto_file_status" >> "$row_file"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload LTO object path diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-lto-object-path-${{ matrix.mode.label }}-${{ matrix.variant.label }}
+          path: neon-rej-diagnostics/0c67-lto-object-path-${{ matrix.mode.label }}-${{ matrix.variant.label }}
