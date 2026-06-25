@@ -1,0 +1,373 @@
+name: NEON rejection sampler public Xcode 0c67 manual relink
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  manual-relink:
+    name: 0c67 manual relink ${{ matrix.mode.label }} ${{ matrix.variant.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+        variant:
+          - label: xcode15_0_1_default
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            build_extra_rustflags: ""
+            manual_extra_cc_flags: ""
+          - label: xcode15_0_1_ld_classic
+            developer_dir: /Applications/Xcode_15.0.1.app/Contents/Developer
+            build_extra_rustflags: "-C link-arg=-Wl,-ld_classic"
+            manual_extra_cc_flags: "-Wl,-ld_classic"
+          - label: xcode15_1_default
+            developer_dir: /Applications/Xcode_15.1.app/Contents/Developer
+            build_extra_rustflags: ""
+            manual_extra_cc_flags: ""
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build once and manually relink saved object
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="${{ matrix.variant.developer_dir }}"
+          mode="${{ matrix.mode.label }}"
+          variant="${{ matrix.variant.label }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          build_extra_rustflags="${{ matrix.variant.build_extra_rustflags }}"
+          manual_extra_cc_flags="${{ matrix.variant.manual_extra_cc_flags }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-manual-relink-${mode}-${variant}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          row_file="$out_dir/summary.row.tsv"
+          manual_bin="$out_dir/nistkats.manual-relink"
+          manual_map="$out_dir/nistkats.manual-relink.map"
+          manual_dash="$out_dir/manual-relink.cc-dash.log"
+          manual_link_log="$out_dir/manual-relink.log"
+
+          {
+            echo "# 0c67 manual relink probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Variant: \`${variant}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Build extra RUSTFLAGS: \`${build_extra_rustflags}\`"
+            echo "Manual extra cc flags: \`${manual_extra_cc_flags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            if [ -d "${developer_dir}" ]; then
+              DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+              DEVELOPER_DIR="${developer_dir}" ld -v || true
+              DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            else
+              echo "selected developer dir absent"
+            fi
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'mode\tvariant\tbuild_status\tcargo_run_status\tmanual_link_status\tmanual_run_status\tobject_line\tcargo_final_line\tmanual_final_line\tobject_sha256\tmanual_sha256\n' > "$row_file"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf '%s\t%s\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' "$mode" "$variant" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in target/release/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find target/release -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local out_file="$3"
+            local symbol_addr target_addr dis_file
+            dis_file="$out_dir/${kind}.disassembly.txt"
+            nm -nm "$path" > "$out_dir/${kind}.nm.txt" 2>&1
+            symbol_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/${kind}.nm.txt")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 12)
+                  hi = min(len(lines), i + 13)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          rustlib="$(rustc +1.78.0 --print target-libdir)"
+          compiler_builtins="$(ls "$rustlib"/libcompiler_builtins-*.rlib | head -n 1)"
+          if [ -z "$compiler_builtins" ]; then
+            echo "missing compiler_builtins" >> "$summary"
+            printf '%s\t%s\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' "$mode" "$variant" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          build_rustflags="-C save-temps ${target_feature_flags} ${build_extra_rustflags}"
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${build_rustflags}\`"
+            echo "- compiler_builtins: \`${compiler_builtins}\`"
+            echo
+          } >> "$summary"
+
+          DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml \
+              --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          selected_bin="$(find_test_binary || true)"
+          selected_obj="$(find_target_object || true)"
+          object_line="missing"
+          cargo_final_line="missing"
+          manual_final_line="missing"
+          object_sha="missing"
+          manual_sha="missing"
+          cargo_run_status="NA"
+          manual_link_status="NA"
+          manual_run_status="NA"
+
+          if [ -n "$selected_obj" ]; then
+            object_sha="$(shasum -a 256 "$selected_obj" | awk '{ print $1 }')"
+            target_line object "$selected_obj" "$out_dir/object.target-line.txt"
+            object_line="$(cat "$out_dir/object.target-line.txt")"
+          fi
+
+          if [ -n "$selected_bin" ]; then
+            target_line cargo-final "$selected_bin" "$out_dir/cargo-final.target-line.txt"
+            cargo_final_line="$(cat "$out_dir/cargo-final.target-line.txt")"
+            run_with_timeout 180 "$selected_bin" kyber1024_nist_known_answer_tests --exact --nocapture \
+              > "$out_dir/cargo-final-test.log" 2>&1
+            cargo_run_status=$?
+          fi
+
+          if [ -n "$selected_obj" ] && [ -n "$compiler_builtins" ]; then
+            read -r -a manual_extra_array <<< "$manual_extra_cc_flags"
+            {
+              echo "manual relink command:"
+              printf 'DEVELOPER_DIR=%q xcrun cc -arch arm64 -nodefaultlibs -o %q %q %q -L %q -L %q -liconv -lSystem -lc -lm -Wl,-dead_strip -Wl,-map,%q' \
+                "$developer_dir" "$manual_bin" "$selected_obj" "$compiler_builtins" "$PWD/target/release/deps" "$rustlib" "$manual_map"
+              for arg in "${manual_extra_array[@]}"; do
+                printf ' %q' "$arg"
+              done
+              echo
+            } > "$manual_link_log"
+
+            {
+              DEVELOPER_DIR="${developer_dir}" xcrun cc -### \
+                -arch arm64 -nodefaultlibs \
+                -o "$manual_bin" \
+                "$selected_obj" \
+                "$compiler_builtins" \
+                -L "$PWD/target/release/deps" \
+                -L "$rustlib" \
+                -liconv -lSystem -lc -lm \
+                -Wl,-dead_strip \
+                -Wl,-map,"$manual_map" \
+                "${manual_extra_array[@]}"
+              echo "cc_dash_status=$?"
+            } > "$manual_dash" 2>&1
+
+            DEVELOPER_DIR="${developer_dir}" xcrun cc \
+              -arch arm64 -nodefaultlibs \
+              -o "$manual_bin" \
+              "$selected_obj" \
+              "$compiler_builtins" \
+              -L "$PWD/target/release/deps" \
+              -L "$rustlib" \
+              -liconv -lSystem -lc -lm \
+              -Wl,-dead_strip \
+              -Wl,-map,"$manual_map" \
+              "${manual_extra_array[@]}" \
+              >> "$manual_link_log" 2>&1
+            manual_link_status=$?
+
+            if [ "$manual_link_status" = 0 ] && [ -f "$manual_bin" ]; then
+              manual_sha="$(shasum -a 256 "$manual_bin" | awk '{ print $1 }')"
+              target_line manual-final "$manual_bin" "$out_dir/manual-final.target-line.txt"
+              manual_final_line="$(cat "$out_dir/manual-final.target-line.txt")"
+              run_with_timeout 180 "$manual_bin" kyber1024_nist_known_answer_tests --exact --nocapture \
+                > "$out_dir/manual-final-test.log" 2>&1
+              manual_run_status=$?
+            fi
+          fi
+
+          {
+            echo "- build exit: \`${build_status}\`"
+            echo "- selected binary: \`${selected_bin:-missing}\`"
+            echo "- selected object: \`${selected_obj:-missing}\`"
+            echo "- object sha256: \`${object_sha}\`"
+            echo "- cargo final run exit: \`${cargo_run_status}\`"
+            echo "- manual link exit: \`${manual_link_status}\`"
+            echo "- manual final run exit: \`${manual_run_status}\`"
+            echo "- manual sha256: \`${manual_sha}\`"
+            echo
+            echo "## Target lines"
+            echo
+            echo "- object: \`${object_line}\`"
+            echo "- cargo final: \`${cargo_final_line}\`"
+            echo "- manual final: \`${manual_final_line}\`"
+            echo
+            echo "## Manual linker cc -###"
+            echo
+            echo "\`\`\`text"
+            sed -n '1,120p' "$manual_dash" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$mode" "$variant" "$build_status" "$cargo_run_status" "$manual_link_status" "$manual_run_status" \
+            "$object_line" "$cargo_final_line" "$manual_final_line" "$object_sha" "$manual_sha" >> "$row_file"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-manual-relink-${{ matrix.mode.label }}-${{ matrix.variant.label }}
+          path: neon-rej-diagnostics/**
+          if-no-files-found: warn
