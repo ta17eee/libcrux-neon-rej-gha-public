@@ -18,32 +18,32 @@ jobs:
           - mode: ordinary
             variant: profile_lto_fat
             extra_rustflags: ""
-            lto_literal: '"fat"'
+            lto_kind: "fat"
             codegen_units: "1"
           - mode: plus-neon
             variant: profile_lto_fat
             extra_rustflags: "-C target_feature=+neon"
-            lto_literal: '"fat"'
+            lto_kind: "fat"
             codegen_units: "1"
           - mode: ordinary
             variant: profile_lto_thin
             extra_rustflags: ""
-            lto_literal: '"thin"'
+            lto_kind: "thin"
             codegen_units: "1"
           - mode: plus-neon
             variant: profile_lto_thin
             extra_rustflags: "-C target_feature=+neon"
-            lto_literal: '"thin"'
+            lto_kind: "thin"
             codegen_units: "1"
           - mode: ordinary
             variant: profile_lto_off
             extra_rustflags: ""
-            lto_literal: "false"
+            lto_kind: "false"
             codegen_units: "1"
           - mode: plus-neon
             variant: profile_lto_off
             extra_rustflags: "-C target_feature=+neon"
-            lto_literal: "false"
+            lto_kind: "false"
             codegen_units: "1"
 
     steps:
@@ -96,7 +96,7 @@ jobs:
           mode="${{ matrix.mode }}"
           variant="${{ matrix.variant }}"
           extra_rustflags="${{ matrix.extra_rustflags }}"
-          lto_literal="${{ matrix.lto_literal }}"
+          lto_kind="${{ matrix.lto_kind }}"
           codegen_units="${{ matrix.codegen_units }}"
           target_hash="h8997d6f42564fb09"
           target_offset_hex="0x2d3c"
@@ -114,7 +114,7 @@ jobs:
             echo "Mode: \`${mode}\`"
             echo "Variant: \`${variant}\`"
             echo "Extra RUSTFLAGS: \`${extra_rustflags}\`"
-            echo "Profile patch: \`lto = ${lto_literal}, codegen-units = ${codegen_units}\`"
+            echo "Profile patch: \`lto kind = ${lto_kind}, codegen-units = ${codegen_units}\`"
             echo "Fat-LTO reference target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
             echo
             echo "## Runner and toolchain"
@@ -138,11 +138,17 @@ jobs:
             exit 0
           fi
 
-          python3 - "$lto_literal" "$codegen_units" Cargo.toml <<'PY'
+          python3 - "$lto_kind" "$codegen_units" Cargo.toml <<'PY'
           import re
           import sys
 
-          lto_literal, codegen_units, path = sys.argv[1:]
+          lto_kind, codegen_units, path = sys.argv[1:]
+          if lto_kind == "false":
+              lto_literal = "false"
+          elif lto_kind in ("thin", "fat"):
+              lto_literal = f'"{lto_kind}"'
+          else:
+              raise SystemExit(f"unknown lto kind: {lto_kind}")
           lines = open(path, encoding="utf-8").read().splitlines(True)
           start = next(i for i, line in enumerate(lines) if line.strip() == "[profile.release]")
           end = len(lines)
