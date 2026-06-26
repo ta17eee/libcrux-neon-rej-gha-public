@@ -189,6 +189,22 @@ def cpi_subsets(prefix, symbols, mode):
                 out.append((f"zero_{sym}", [sym]))
         return out
 
+    if mode == "q1_triplet":
+        q1_hi = min(3, (n + 3) // 4)
+        q1 = symbols[:q1_hi]
+        cuts = [
+            ("q1_0_1", [0, 1]),
+            ("q1_0_2", [0, 2]),
+            ("q1_1_2", [1, 2]),
+            ("q1_0_1_2", [0, 1, 2]),
+        ]
+        out = []
+        for label, indexes in cuts:
+            subset = [q1[i] for i in indexes if i < len(q1)]
+            if subset:
+                out.append((f"zero_{prefix}{label}", subset))
+        return out
+
     cuts = {
         "first_half": (0, (n + 1) // 2),
         "second_half": ((n + 1) // 2, n),
