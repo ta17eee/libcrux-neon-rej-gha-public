@@ -1,0 +1,368 @@
+name: NEON rejection sampler public Xcode Rust large body shape
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  rust-large-body-shape:
+    name: Rust large body shape
+    runs-on: macos-14
+
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Install historical toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build and link Rust large-body objects
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/rust-large-body-shape"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# Rust large-body Mach-O shape probe"
+            echo
+            echo "Developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            rustc +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'body_ops\tcase\tlink_variant\tcompile_status\tlink_status\trun_status\tobject_line\tfinal_line\tobject_sha256\tfinal_sha256\ttext_relocs\tcompact_unwind_relocs\teh_frame_relocs\ttext_size\tobject_size\n' > "$rows"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf 'missing_xcode\tall\tNA\tNA\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          emit_rust_source() {
+            local path="$1"
+            local body_ops="$2"
+            python3 - "$path" "$body_ops" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          body_ops = int(sys.argv[2])
+
+          with open(path, "w") as f:
+              f.write(r'''#![no_std]
+          use core::arch::{asm, global_asm};
+
+          global_asm!(r#"
+          .text
+          .p2align 2
+          .globl _main
+          .private_extern _main
+          _main:
+          mov w0, #0
+          ret
+          "#);
+
+          ''')
+              for i in range(body_ops):
+                  f.write(f"#[no_mangle]\npub static RUST_STATIC_{i}: u64 = 0x{i ^ 0x9e3779b97f4a7c15:016x};\n")
+              f.write('''#[no_mangle]
+          #[inline(never)]
+          pub unsafe extern "C" fn case_0c67_rust(mut x: u64) -> u64 {
+          ''')
+              for i in range(body_ops // 2):
+                  rot = (i % 63) + 1
+                  f.write(f"    x = x.wrapping_add(core::ptr::read_volatile(&RUST_STATIC_{i}));\n")
+                  f.write(f"    x ^= x.rotate_left({rot});\n")
+              f.write('''    asm!("mov x28, x3", options(nostack, preserves_flags));
+          ''')
+              for i in range(body_ops // 2, body_ops):
+                  rot = (i % 63) + 1
+                  f.write(f"    x = x.wrapping_add(core::ptr::read_volatile(&RUST_STATIC_{i}));\n")
+                  f.write(f"    x = x.rotate_left({rot}).wrapping_add(0x{i:x});\n")
+              f.write('''    x
+          }
+
+          #[no_mangle]
+          #[inline(never)]
+          pub unsafe extern "C" fn case_b9fa_rust(mut x: u64) -> u64 {
+          ''')
+              for i in range(body_ops // 2):
+                  rot = ((i + 7) % 63) + 1
+                  f.write(f"    x = x.wrapping_add(core::ptr::read_volatile(&RUST_STATIC_{i}));\n")
+                  f.write(f"    x ^= x.rotate_left({rot});\n")
+              f.write('''    asm!(
+              "2:",
+              "nop",
+              "b 2b",
+              options(nostack, preserves_flags)
+          );
+          ''')
+              for i in range(body_ops // 2, body_ops):
+                  rot = ((i + 11) % 63) + 1
+                  f.write(f"    x = x.wrapping_add(core::ptr::read_volatile(&RUST_STATIC_{i}));\n")
+                  f.write(f"    x = x.rotate_right({rot}).wrapping_add(0x{i:x});\n")
+              f.write('''    x
+          }
+          ''')
+          PY
+          }
+
+          target_pattern_line() {
+            local kind="$1"
+            local path="$2"
+            local symbol="$3"
+            local pattern="$4"
+            local out_file="$5"
+            local dis_file="$out_file.disassembly.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --disassemble "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$symbol" "$pattern" "$out_file" <<'PY'
+          import re, sys
+          path, symbol, pattern, out = sys.argv[1:]
+          lines = open(path, errors="replace").read().splitlines()
+          start = None
+          end = len(lines)
+          sym_re = re.compile(r"^_" + re.escape(symbol.lstrip("_")) + r":$")
+          any_sym_re = re.compile(r"^_[A-Za-z0-9_.$]+:$")
+          for i, line in enumerate(lines):
+              if sym_re.match(line.strip()):
+                  start = i
+                  break
+          if start is not None:
+              for j in range(start + 1, len(lines)):
+                  if any_sym_re.match(lines[j].strip()):
+                      end = j
+                      break
+          else:
+              start = 0
+          found = "missing"
+          pat = pattern.lower()
+          for i in range(start, end):
+              if pat in lines[i].lower():
+                  found = lines[i].strip()
+                  lo = max(0, i - 10)
+                  hi = min(len(lines), i + 11)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          count_relocs() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              index($0, "Relocation information (" s ")") { print $(NF-1); found=1 }
+              END { if (!found) print 0 }
+            ' "$file"
+          }
+
+          section_size() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              $1 == "sectname" && $2 == s { in_section=1; next }
+              in_section && $1 == "size" { print $2; found=1; exit }
+              END { if (!found) print "NA" }
+            ' "$file"
+          }
+
+          link_with_ld() {
+            local body_ops="$1"
+            local obj="$2"
+            local link_variant="$3"
+            local use_classic="$4"
+            local link_dir="$out_dir/body-${body_ops}/${link_variant}"
+            local bin="$link_dir/rust_large_body.${body_ops}.${link_variant}"
+            local map="$link_dir/rust_large_body.${body_ops}.${link_variant}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -demangle
+              -dynamic
+              -arch arm64
+              -platform_version macos 14.0.0 14.0
+              -syslibroot "$sdkroot"
+              -o "$bin"
+              "$obj"
+              -lSystem
+              -u _main
+              -u _case_0c67_rust
+              -u _case_b9fa_rust
+              -dead_strip
+              -map "$map"
+            )
+            if [ "$use_classic" = "yes" ]; then
+              args+=(-ld_classic)
+            fi
+            {
+              printf 'DEVELOPER_DIR=%q xcrun ld' "$developer_dir"
+              printf ' %q' "${args[@]}"
+              echo
+            } > "$link_dir/ld-command.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun ld "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          record_variant() {
+            local body_ops="$1"
+            local compile_status="$2"
+            local obj="$3"
+            local link_variant="$4"
+            local bin="$5"
+            local link_status="$6"
+            local body_dir="$out_dir/body-${body_ops}"
+            local meta_dir="$body_dir/object"
+            local link_dir="$body_dir/${link_variant}"
+            local run_status="NA"
+            local final_sha="NA"
+            local object_sha="NA"
+            local object_b9fa="missing"
+            local object_0c67="missing"
+            local final_b9fa="missing"
+            local final_0c67="missing"
+            local text_relocs="NA"
+            local compact_unwind_relocs="NA"
+            local eh_frame_relocs="NA"
+            local text_size="NA"
+            local object_size="NA"
+            if [ "$compile_status" -eq 0 ]; then
+              object_sha="$(shasum -a 256 "$obj" | awk '{print $1}')"
+              object_size="$(stat -f '%z' "$obj")"
+              text_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__TEXT,__text")"
+              compact_unwind_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__LD,__compact_unwind")"
+              eh_frame_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__TEXT,__eh_frame")"
+              text_size="$(section_size "$meta_dir/otool-load-commands.txt" "__text")"
+              target_pattern_line "body-${body_ops}-b9fa-object" "$obj" "_case_b9fa_rust" "ff ff ff 17" "$meta_dir/object.b9fa.target-line.txt"
+              target_pattern_line "body-${body_ops}-0c67-object" "$obj" "_case_0c67_rust" "fc 03 03 aa" "$meta_dir/object.0c67.target-line.txt"
+              object_b9fa="$(cat "$meta_dir/object.b9fa.target-line.txt")"
+              object_0c67="$(cat "$meta_dir/object.0c67.target-line.txt")"
+            fi
+            if [ "$link_status" -eq 0 ]; then
+              final_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
+              target_pattern_line "body-${body_ops}-${link_variant}-b9fa-final" "$bin" "_case_b9fa_rust" "ff ff ff 17" "$link_dir/final.b9fa.target-line.txt"
+              target_pattern_line "body-${body_ops}-${link_variant}-0c67-final" "$bin" "_case_0c67_rust" "fc 03 03 aa" "$link_dir/final.0c67.target-line.txt"
+              final_b9fa="$(cat "$link_dir/final.b9fa.target-line.txt")"
+              final_0c67="$(cat "$link_dir/final.0c67.target-line.txt")"
+              run_with_timeout 20 "$bin" > "$link_dir/run.log" 2>&1
+              run_status=$?
+            fi
+            {
+              echo "## body_ops ${body_ops} / ${link_variant}"
+              echo
+              echo "- compile_status: \`${compile_status}\`"
+              echo "- link_status: \`${link_status}\`"
+              echo "- run_status: \`${run_status}\`"
+              echo "- object_sha256: \`${object_sha}\`"
+              echo "- final_sha256: \`${final_sha}\`"
+              echo "- b9fa object target: \`${object_b9fa}\`"
+              echo "- b9fa final target: \`${final_b9fa}\`"
+              echo "- 0c67 object target: \`${object_0c67}\`"
+              echo "- 0c67 final target: \`${final_0c67}\`"
+              echo "- text_relocs: \`${text_relocs}\`"
+              echo "- compact_unwind_relocs: \`${compact_unwind_relocs}\`"
+              echo "- eh_frame_relocs: \`${eh_frame_relocs}\`"
+              echo "- text_size: \`${text_size}\`"
+              echo "- object_size: \`${object_size}\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/link.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            printf '%s\tb9fa\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$body_ops" "$link_variant" "$compile_status" "$link_status" "$run_status" \
+              "$object_b9fa" "$final_b9fa" "$object_sha" "$final_sha" \
+              "$text_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" "$text_size" "$object_size" >> "$rows"
+            printf '%s\t0c67\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$body_ops" "$link_variant" "$compile_status" "$link_status" "$run_status" \
+              "$object_0c67" "$final_0c67" "$object_sha" "$final_sha" \
+              "$text_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" "$text_size" "$object_size" >> "$rows"
+          }
+
+          for body_ops in 128 512 2048; do
+            body_dir="$out_dir/body-${body_ops}"
+            mkdir -p "$body_dir/object"
+            src="$body_dir/lib.rs"
+            obj="$body_dir/lib.o"
+            emit_rust_source "$src" "$body_ops"
+            rustc +1.78.0 --crate-type lib -O -C force-unwind-tables=yes --emit=obj -o "$obj" "$src" > "$body_dir/rustc.log" 2>&1
+            compile_status=$?
+            if [ "$compile_status" -eq 0 ]; then
+              otool -l "$obj" > "$body_dir/object/otool-load-commands.txt" 2>&1 || true
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --reloc "$obj" > "$body_dir/object/objdump-relocs.txt" 2>&1 || true
+            fi
+            for link_variant in ld_new_no_lto ld_classic_no_lto; do
+              use_classic=no
+              if [ "$link_variant" = "ld_classic_no_lto" ]; then
+                use_classic=yes
+              fi
+              if [ "$compile_status" -eq 0 ]; then
+                bin="$(link_with_ld "$body_ops" "$obj" "$link_variant" "$use_classic")"
+                link_status="$(cat "$body_dir/${link_variant}/status.txt")"
+              else
+                bin=""
+                link_status="NA"
+              fi
+              record_variant "$body_ops" "$compile_status" "$obj" "$link_variant" "$bin" "$link_status"
+            done
+          done
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-rust-large-body-shape
+          path: neon-rej-diagnostics/**
