@@ -159,10 +159,36 @@ def symbols_with_prefix(src, prefix):
     return sorted(names, key=lambda s: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", s)])
 
 
-def cpi_subsets(prefix, symbols):
+def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
+    if mode == "q1_detail":
+        q1_hi = (n + 3) // 4
+        q1 = symbols[:q1_hi]
+        cuts = [
+            ("q1", 0, q1_hi),
+            ("q1_left", 0, min(5, q1_hi)),
+            ("q1_right", min(5, q1_hi), q1_hi),
+            ("q1_0_2", 0, min(3, q1_hi)),
+            ("q1_3_4", min(3, q1_hi), min(5, q1_hi)),
+            ("q1_5_6", min(5, q1_hi), min(7, q1_hi)),
+            ("q1_7_8", min(7, q1_hi), q1_hi),
+        ]
+        out = []
+        seen = set()
+        for label, lo, hi in cuts:
+            subset = q1[lo:hi]
+            key = tuple(subset)
+            if subset and key not in seen:
+                seen.add(key)
+                out.append((f"zero_{prefix}{label}", subset))
+        for idx in [0, 3, 4, 5, 6, 7, 8]:
+            if idx < len(q1):
+                sym = q1[idx]
+                out.append((f"zero_{sym}", [sym]))
+        return out
+
     cuts = {
         "first_half": (0, (n + 1) // 2),
         "second_half": ((n + 1) // 2, n),
@@ -184,10 +210,11 @@ def add_hex(a, b):
     return int(a, 16) + int(b, 16)
 
 
-def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer_dir):
+def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer_dir, compact):
     nm_path = out_dir / f"{prefix}.nm.txt"
     nm_text = output(["nm", "-nm", str(path)])
-    nm_path.write_text(nm_text + "\n")
+    if not compact:
+        nm_path.write_text(nm_text + "\n")
     symbol_addr = None
     for line in nm_text.splitlines():
         if target_hash in line:
@@ -206,7 +233,8 @@ def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    dis_path.write_text(proc.stdout)
+    if not compact:
+        dis_path.write_text(proc.stdout)
     lines = proc.stdout.splitlines()
     for i, line in enumerate(lines):
         m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
@@ -218,12 +246,13 @@ def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer
     return "missing"
 
 
-def find_target_object(target_root, target_hash, preferred_prefix, out_dir):
+def find_target_object(target_root, target_hash, preferred_prefix, out_dir, compact):
     candidates = []
     for obj in sorted(Path(target_root).rglob("*.o")):
         proc = subprocess.run(["nm", "-nm", str(obj)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         nm_text = proc.stdout
-        (out_dir / f"{obj.name}.nm.txt").write_text(nm_text)
+        if not compact:
+            (out_dir / f"{obj.name}.nm.txt").write_text(nm_text)
         if target_hash in nm_text:
             candidates.append(obj)
     (out_dir / "object-candidates.txt").write_text("\n".join(str(c) for c in candidates) + ("\n" if candidates else ""))
@@ -256,8 +285,9 @@ def link_object(object_path, variant, classic, cfg, out_dir):
         "-lc",
         "-lm",
         "-dead_strip",
-        "-map", str(map_path),
     ]
+    if not cfg["compact_artifacts"]:
+        args += ["-map", str(map_path)]
     if classic:
         args.append("-ld_classic")
     (link_dir / "ld-command.txt").write_text("DEVELOPER_DIR={} {}\n".format(cfg["developer_dir"], " ".join(args)))
@@ -281,6 +311,8 @@ def main():
         "corrupt_bytes": os.environ["PROBE_CORRUPT_BYTES"],
         "near_literals": [s for s in os.environ["PROBE_NEAR_LITERALS"].split(",") if s],
         "cpi_prefix": os.environ.get("PROBE_CPI_PREFIX", ""),
+        "cpi_subset_mode": os.environ.get("PROBE_CPI_SUBSET_MODE", "range"),
+        "compact_artifacts": os.environ.get("PROBE_COMPACT_ARTIFACTS", "") == "1",
         "developer_dir": "/Applications/Xcode_15.0.1.app/Contents/Developer",
         "target_root": str(Path.cwd() / "target" / "release"),
     }
@@ -323,7 +355,7 @@ def main():
     if proc.returncode != 0:
         raise SystemExit(0)
 
-    selected = find_target_object(cfg["target_root"], cfg["target_hash"], cfg["preferred_object_prefix"], out_dir)
+    selected = find_target_object(cfg["target_root"], cfg["target_hash"], cfg["preferred_object_prefix"], out_dir, cfg["compact_artifacts"])
     append(summary, f"- selected object: `{selected}`\n\n")
     if selected is None:
         raise SystemExit(0)
@@ -351,7 +383,7 @@ def main():
     cpi_symbols = symbols_with_prefix(selected, cfg["cpi_prefix"])
     if cpi_symbols:
         (obj_dir / "cpi-prefix-symbols.txt").write_text("\n".join(cpi_symbols) + "\n")
-        for subset_label, subset_symbols in cpi_subsets(cfg["cpi_prefix"], cpi_symbols):
+        for subset_label, subset_symbols in cpi_subsets(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = zero_symbols(selected, dst, subset_symbols, 16, log)
@@ -361,7 +393,11 @@ def main():
         if transform_status != 0 or not Path(obj_path).exists():
             append(rows, f"{cfg['label']}\t{variant}\t{transform_status}\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\t{transform_log}\n")
             continue
-        obj_line = target_line(obj_path, cfg["target_hash"], cfg["target_offset_hex"], out_dir, f"{variant}.object", cfg["developer_dir"])
+        obj_line = target_line(obj_path, cfg["target_hash"], cfg["target_offset_hex"], out_dir, f"{variant}.object", cfg["developer_dir"], cfg["compact_artifacts"])
+        obj_expected = str(count_bytes(selected, cfg["expected_bytes"]))
+        variant_expected = str(count_bytes(obj_path, cfg["expected_bytes"]))
+        obj_hash = sha256(selected)
+        variant_hash = sha256(obj_path)
         for classic in (False, True):
             link_variant = "ld_classic_no_lto" if classic else "ld_new_no_lto"
             bin_path, link_status, _link_dir = link_object(obj_path, variant, classic, cfg, out_dir)
@@ -370,10 +406,12 @@ def main():
             final_corrupt = "NA"
             final_hash = "NA"
             if link_status == 0:
-                final_line = target_line(bin_path, cfg["target_hash"], cfg["target_offset_hex"], out_dir, f"{variant}.{link_variant}.final", cfg["developer_dir"])
+                final_line = target_line(bin_path, cfg["target_hash"], cfg["target_offset_hex"], out_dir, f"{variant}.{link_variant}.final", cfg["developer_dir"], cfg["compact_artifacts"])
                 final_expected = str(count_bytes(bin_path, cfg["expected_bytes"]))
                 final_corrupt = str(count_bytes(bin_path, cfg["corrupt_bytes"]))
                 final_hash = sha256(bin_path)
+                if cfg["compact_artifacts"]:
+                    bin_path.unlink(missing_ok=True)
             append(rows, "\t".join([
                 cfg["label"],
                 variant,
@@ -382,15 +420,17 @@ def main():
                 str(link_status),
                 obj_line.replace("\t", " "),
                 final_line.replace("\t", " "),
-                str(count_bytes(selected, cfg["expected_bytes"])),
-                str(count_bytes(obj_path, cfg["expected_bytes"])),
+                obj_expected,
+                variant_expected,
                 final_expected,
                 final_corrupt,
-                sha256(selected),
-                sha256(obj_path),
+                obj_hash,
+                variant_hash,
                 final_hash,
                 transform_log.replace("\t", " ").replace("\n", "; "),
             ]) + "\n")
+        if cfg["compact_artifacts"] and obj_path != selected:
+            Path(obj_path).unlink(missing_ok=True)
 
     append(summary, "## Rows\n\n```tsv\n" + rows.read_text() + "```\n")
 
