@@ -122,6 +122,49 @@ def zero_symbols(src, dst, symbols, size, log_path):
     return 0
 
 
+def zero_symbol_ranges(src, dst, ranges, log_path):
+    data = bytearray(Path(src).read_bytes())
+    sections = macho_sections(data)
+    wanted = {name for name, _offset, _size in ranges}
+    nm_out = output(["xcrun", "llvm-nm", "-nm", str(src)])
+    nm_re = re.compile(r"^([0-9a-fA-F]+) \(([^,]+),([^)]+)\) .* ([^ ]+)$")
+    found = {}
+    for line in nm_out.splitlines():
+        match = nm_re.match(line.strip())
+        if not match:
+            continue
+        name = match.group(4)
+        if name in wanted:
+            found[name] = (int(match.group(1), 16), match.group(2), match.group(3))
+    missing = sorted(wanted - set(found))
+    lines = []
+    if missing:
+        lines.append("missing symbols: " + " ".join(missing))
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 44
+    for name, offset, size in ranges:
+        value, sym_seg, sym_sect = found[name]
+        candidates = [s for s in sections if s[0] == sym_seg and s[1] == sym_sect and s[2] <= value < s[2] + s[3]]
+        if not candidates:
+            lines.append(f"{name}: no containing section for value=0x{value:x} {sym_seg},{sym_sect}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        seg, sect, addr, sect_size, file_offset = candidates[0]
+        rel = value - addr
+        start = file_offset + rel + offset
+        end = start + size
+        if offset < 0 or size <= 0 or rel + offset + size > sect_size or end > len(data):
+            lines.append(f"{name}: zero range out of section/file value=0x{value:x} rel={rel} offset={offset} size={size}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        old = bytes(data[start:end])
+        data[start:end] = b"\0" * size
+        lines.append(f"zeroed {name}+{offset}:{offset + size} {seg},{sect} value=0x{value:x} file_offset={start} old={old.hex()}")
+    Path(dst).write_bytes(data)
+    Path(log_path).write_text("\n".join(lines) + "\n")
+    return 0
+
+
 def zero_section(src, dst, section_name, log_path):
     target_seg, target_sect = section_name.split(",", 1)
     data = bytearray(Path(src).read_bytes())
@@ -163,6 +206,8 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
+    if mode == "cpi01_words":
+        return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
         q1 = symbols[:q1_hi]
@@ -219,6 +264,27 @@ def cpi_subsets(prefix, symbols, mode):
         if subset:
             out.append((f"zero_{prefix}{label}", subset))
     out.append((f"zero_{prefix}all", symbols))
+    return out
+
+
+def cpi_range_subsets(prefix, symbols, mode):
+    if mode != "cpi01_words" or len(symbols) < 2:
+        return []
+    s0 = symbols[0]
+    s1 = symbols[1]
+    out = [(f"zero_{prefix}cpi01_full", [(s0, 0, 16), (s1, 0, 16)])]
+    for a_off in (0, 8):
+        for b_off in (0, 8):
+            out.append((
+                f"zero_{prefix}cpi01_h{a_off // 8}{b_off // 8}",
+                [(s0, a_off, 8), (s1, b_off, 8)],
+            ))
+    for a_idx in range(4):
+        for b_idx in range(4):
+            out.append((
+                f"zero_{prefix}cpi01_w{a_idx}{b_idx}",
+                [(s0, a_idx * 4, 4), (s1, b_idx * 4, 4)],
+            ))
     return out
 
 
@@ -403,6 +469,11 @@ def main():
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = zero_symbols(selected, dst, subset_symbols, 16, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, ranges in cpi_range_subsets(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = zero_symbol_ranges(selected, dst, ranges, log)
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     for variant, obj_path, transform_status, transform_log in variants:
