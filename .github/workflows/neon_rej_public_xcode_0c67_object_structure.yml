@@ -1,0 +1,157 @@
+name: NEON rejection sampler public Xcode 0c67 object structure
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  object-structure:
+    name: ${{ matrix.probe.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        probe:
+          - label: 0c67 ordinary object structure
+            artifact_suffix: 0c67-ordinary-object-structure
+            ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run
+            preferred_object_prefix: nistkats-
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            target_feature_flags: ""
+            cpi_prefix: "lCPI203_"
+          - label: 0c67 plus-neon object structure
+            artifact_suffix: 0c67-plus-neon-object-structure
+            ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run
+            preferred_object_prefix: nistkats-
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            target_feature_flags: "-C target_feature=+neon"
+            cpi_prefix: "lCPI210_"
+
+    steps:
+      - name: Checkout probe repository
+        uses: actions/checkout@v4
+        with:
+          path: probe-repo
+
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.probe.ref }}
+          path: libcrux
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        working-directory: libcrux
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        run: rustup toolchain install 1.78.0
+
+      - name: Build and dump selected object structure
+        working-directory: libcrux
+        env:
+          PROBE_LABEL: ${{ matrix.probe.label }}
+          PROBE_ARTIFACT_SUFFIX: ${{ matrix.probe.artifact_suffix }}
+          PROBE_TARGET_FEATURE_FLAGS: ${{ matrix.probe.target_feature_flags }}
+          PROBE_TARGET_HASH: ${{ matrix.probe.target_hash }}
+          PROBE_TARGET_OFFSET_HEX: ${{ matrix.probe.target_offset_hex }}
+          PROBE_PREFERRED_OBJECT_PREFIX: ${{ matrix.probe.preferred_object_prefix }}
+          PROBE_CARGO_ARGS: ${{ matrix.probe.cargo_args }}
+          PROBE_CPI_PREFIX: ${{ matrix.probe.cpi_prefix }}
+          DEVELOPER_DIR: /Applications/Xcode_15.0.1.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          out="neon-rej-diagnostics/target-object-structure-${PROBE_ARTIFACT_SUFFIX}"
+          mkdir -p "${out}"
+          {
+            echo "# target object structure probe"
+            echo
+            echo "Label: \`${PROBE_LABEL}\`"
+            echo
+            echo '```text'
+            sw_vers
+            uname -a
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            xcodebuild -version
+            xcrun --find ld
+            xcrun --show-sdk-path
+            ld -v
+            echo '```'
+          } > "${out}/summary.md"
+
+          rustflags="-C save-temps"
+          if [ -n "${PROBE_TARGET_FEATURE_FLAGS}" ]; then
+            rustflags="${rustflags} ${PROBE_TARGET_FEATURE_FLAGS}"
+          fi
+          echo "RUSTFLAGS=${rustflags}" | tee "${out}/rustflags.txt"
+          RUSTFLAGS="${rustflags}" cargo +1.78.0 test ${PROBE_CARGO_ARGS} > "${out}/build.log" 2>&1
+
+          find target/release -name '*.o' -print0 \
+            | xargs -0 nm -nm > "${out}/all-object-nm.txt"
+          grep -B1 -A3 "${PROBE_TARGET_HASH}" "${out}/all-object-nm.txt" > "${out}/target-object-nm-grep.txt" || true
+
+          selected=""
+          while IFS= read -r obj; do
+            if nm -nm "${obj}" | grep -q "${PROBE_TARGET_HASH}"; then
+              echo "${obj}" >> "${out}/object-candidates.txt"
+              base="$(basename "${obj}")"
+              if [ -z "${selected}" ] || [[ "${base}" == ${PROBE_PREFERRED_OBJECT_PREFIX}* ]]; then
+                selected="${obj}"
+              fi
+            fi
+          done < <(find target/release -name '*.o' | sort)
+          test -n "${selected}"
+          echo "${selected}" | tee "${out}/selected-object.txt"
+
+          xcrun llvm-nm -nm "${selected}" > "${out}/llvm-nm-nm.txt"
+          grep "${PROBE_CPI_PREFIX}" "${out}/llvm-nm-nm.txt" > "${out}/cpi-symbols.txt" || true
+          grep "${PROBE_TARGET_HASH}" "${out}/llvm-nm-nm.txt" > "${out}/target-symbols.txt" || true
+          xcrun llvm-objdump --macho --section-headers "${selected}" > "${out}/objdump-section-headers.txt"
+          xcrun llvm-objdump --macho --syms "${selected}" > "${out}/objdump-syms.txt"
+          xcrun llvm-objdump --macho --reloc "${selected}" > "${out}/objdump-reloc.txt"
+          xcrun llvm-objdump --macho --reloc --section=__TEXT,__text "${selected}" > "${out}/objdump-text-reloc.txt" || true
+          xcrun llvm-objdump --macho --full-contents --section=__TEXT,__literal16 "${selected}" > "${out}/objdump-literal16-contents.txt" || true
+          otool -l "${selected}" > "${out}/otool-l.txt"
+          otool -rv "${selected}" > "${out}/otool-rv.txt" || true
+          grep -E "${PROBE_TARGET_HASH}|${PROBE_CPI_PREFIX}" "${out}/objdump-reloc.txt" "${out}/otool-rv.txt" > "${out}/focused-reloc-grep.txt" || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-object-structure-${{ matrix.probe.artifact_suffix }}
+          path: libcrux/neon-rej-diagnostics/**
