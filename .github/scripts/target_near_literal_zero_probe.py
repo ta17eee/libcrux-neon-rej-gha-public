@@ -206,7 +206,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode == "cpi01_words":
+    if mode in ("cpi01_words", "cpi01_asym"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -268,11 +268,33 @@ def cpi_subsets(prefix, symbols, mode):
 
 
 def cpi_range_subsets(prefix, symbols, mode):
-    if mode != "cpi01_words" or len(symbols) < 2:
+    if mode not in ("cpi01_words", "cpi01_asym") or len(symbols) < 2:
         return []
     s0 = symbols[0]
     s1 = symbols[1]
     out = [(f"zero_{prefix}cpi01_full", [(s0, 0, 16), (s1, 0, 16)])]
+    if mode == "cpi01_asym":
+        for b_off in (0, 8):
+            out.append((
+                f"zero_{prefix}cpi01_s0full_s1h{b_off // 8}",
+                [(s0, 0, 16), (s1, b_off, 8)],
+            ))
+        for a_off in (0, 8):
+            out.append((
+                f"zero_{prefix}cpi01_s1full_s0h{a_off // 8}",
+                [(s1, 0, 16), (s0, a_off, 8)],
+            ))
+        for b_idx in range(4):
+            out.append((
+                f"zero_{prefix}cpi01_s0full_s1w{b_idx}",
+                [(s0, 0, 16), (s1, b_idx * 4, 4)],
+            ))
+        for a_idx in range(4):
+            out.append((
+                f"zero_{prefix}cpi01_s1full_s0w{a_idx}",
+                [(s1, 0, 16), (s0, a_idx * 4, 4)],
+            ))
+        return out
     for a_off in (0, 8):
         for b_off in (0, 8):
             out.append((
@@ -431,14 +453,19 @@ def main():
     env["DEVELOPER_DIR"] = cfg["developer_dir"]
     env["RUSTFLAGS"] = rustflags
     build_log = out_dir / "build.log"
+    print(f"::group::build {cfg['label']}", flush=True)
+    print(f"RUSTFLAGS={rustflags}", flush=True)
     with open(build_log, "w") as f:
         proc = run(["cargo", "+1.78.0", "test"] + cfg["cargo_args"], env=env, stdout=f, stderr=subprocess.STDOUT)
+    print(f"build status={proc.returncode}", flush=True)
+    print("::endgroup::", flush=True)
     append(summary, f"## Build\n\n- RUSTFLAGS: `{rustflags}`\n- status: `{proc.returncode}`\n\n")
     if proc.returncode != 0:
         raise SystemExit(0)
 
     selected = find_target_object(cfg["target_root"], cfg["target_hash"], cfg["preferred_object_prefix"], out_dir, cfg["compact_artifacts"])
     append(summary, f"- selected object: `{selected}`\n\n")
+    print(f"selected object={selected}", flush=True)
     if selected is None:
         raise SystemExit(0)
 
@@ -476,17 +503,24 @@ def main():
             status = zero_symbol_ranges(selected, dst, ranges, log)
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
+    print(f"prepared variants={len(variants)} mode={cfg['cpi_subset_mode']}", flush=True)
     for variant, obj_path, transform_status, transform_log in variants:
+        print(f"::group::variant {variant}", flush=True)
+        print(f"transform status={transform_status}", flush=True)
         if transform_status != 0 or not Path(obj_path).exists():
             append(rows, f"{cfg['label']}\t{variant}\t{transform_status}\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\t{transform_log}\n")
+            print("missing transformed object", flush=True)
+            print("::endgroup::", flush=True)
             continue
         obj_line = target_line(obj_path, cfg["target_hash"], cfg["target_offset_hex"], out_dir, f"{variant}.object", cfg["developer_dir"], cfg["compact_artifacts"])
+        print(f"object target={obj_line}", flush=True)
         obj_expected = str(count_bytes(selected, cfg["expected_bytes"]))
         variant_expected = str(count_bytes(obj_path, cfg["expected_bytes"]))
         obj_hash = sha256(selected)
         variant_hash = sha256(obj_path)
         for classic in (False, True):
             link_variant = "ld_classic_no_lto" if classic else "ld_new_no_lto"
+            print(f"linking {link_variant}", flush=True)
             bin_path, link_status, _link_dir = link_object(obj_path, variant, classic, cfg, out_dir)
             final_line = "missing"
             final_expected = "NA"
@@ -499,6 +533,7 @@ def main():
                 final_hash = sha256(bin_path)
                 if cfg["compact_artifacts"]:
                     bin_path.unlink(missing_ok=True)
+            print(f"{link_variant} status={link_status} target={final_line}", flush=True)
             append(rows, "\t".join([
                 cfg["label"],
                 variant,
@@ -518,6 +553,7 @@ def main():
             ]) + "\n")
         if cfg["compact_artifacts"] and obj_path != selected:
             Path(obj_path).unlink(missing_ok=True)
+        print("::endgroup::", flush=True)
 
     append(summary, "## Rows\n\n```tsv\n" + rows.read_text() + "```\n")
 
