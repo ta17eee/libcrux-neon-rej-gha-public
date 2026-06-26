@@ -281,6 +281,8 @@ jobs:
               "$obj"
               "$callee_obj"
               -lSystem
+              -u _case_b9fa
+              -u _case_0c67
               -dead_strip
               -map "$map"
             )
