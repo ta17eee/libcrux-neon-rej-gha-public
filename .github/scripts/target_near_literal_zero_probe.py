@@ -310,7 +310,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -431,27 +431,48 @@ def cpi_range_subsets(prefix, symbols, mode):
 
 
 def cpi_pair_transforms(prefix, symbols, mode):
-    if mode != "cpi01_permute" or len(symbols) < 2:
+    if mode not in ("cpi01_permute", "cpi012_equal_pairs"):
         return []
-    s0 = symbols[0]
-    s1 = symbols[1]
+    if mode == "cpi01_permute":
+        if len(symbols) < 2:
+            return []
+        s0 = symbols[0]
+        s1 = symbols[1]
+        modes = [
+            "zero_full",
+            "swap_entries",
+            "reverse_pair",
+            "reverse_each_entry",
+            "swap_first_word",
+            "swap_last_word",
+            "duplicate_0",
+            "duplicate_1",
+            "both_ff",
+            "both_00_0f",
+            "zero_ff",
+            "ff_zero",
+            "duplicate_0_flip_s1_last",
+            "duplicate_1_flip_s0_last",
+        ]
+        return [(f"{prefix}cpi01_{m}", s0, s1, m) for m in modes]
+    if len(symbols) < 3:
+        return []
     modes = [
-        "zero_full",
-        "swap_entries",
-        "reverse_pair",
-        "reverse_each_entry",
-        "swap_first_word",
-        "swap_last_word",
         "duplicate_0",
         "duplicate_1",
         "both_ff",
-        "both_00_0f",
-        "zero_ff",
-        "ff_zero",
         "duplicate_0_flip_s1_last",
-        "duplicate_1_flip_s0_last",
     ]
-    return [(f"{prefix}cpi01_{m}", s0, s1, m) for m in modes]
+    pairs = [
+        ("cpi01", symbols[0], symbols[1]),
+        ("cpi02", symbols[0], symbols[2]),
+        ("cpi12", symbols[1], symbols[2]),
+    ]
+    return [
+        (f"{prefix}{pair_label}_{m}", left, right, m)
+        for pair_label, left, right in pairs
+        for m in modes
+    ]
 
 
 def add_hex(a, b):
