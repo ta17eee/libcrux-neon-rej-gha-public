@@ -432,6 +432,15 @@ def add_hex(a, b):
     return int(a, 16) + int(b, 16)
 
 
+def macho_bytes_at_addr(path, addr, size):
+    data = Path(path).read_bytes()
+    for seg, sect, sect_addr, sect_size, file_offset in macho_sections(data):
+        if sect_addr <= addr and addr + size <= sect_addr + sect_size:
+            off = file_offset + (addr - sect_addr)
+            return bytes(data[off:off + size]), seg, sect, off
+    return None, None, None, None
+
+
 def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer_dir, compact):
     nm_path = out_dir / f"{prefix}.nm.txt"
     nm_text = output(["nm", "-nm", str(path)])
@@ -445,6 +454,14 @@ def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer
     if symbol_addr is None:
         return "missing"
     target = add_hex(hex(symbol_addr), target_offset_hex)
+    raw, seg, sect, file_offset = macho_bytes_at_addr(path, target, 4)
+    if raw is None:
+        return f"{target:x}: missing-section"
+    byte_text = " ".join(f"{b:02x}" for b in raw)
+    word, = struct.unpack("<I", raw)
+    direct_line = f"{target:x}: {byte_text} word=0x{word:08x} ({seg},{sect}) file_offset={file_offset}"
+    if compact:
+        return direct_line
     start_addr = hex(max(0, target - 0x40))
     stop_addr = hex(target + 0x50)
     dis_path = out_dir / f"{prefix}.disassembly.txt"
@@ -472,8 +489,8 @@ def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer
             lo = max(0, i - 10)
             hi = min(len(lines), i + 11)
             (out_dir / f"{prefix}.target-window.txt").write_text("\n".join(lines[lo:hi]) + "\n")
-            return line.strip()
-    return "missing"
+            return f"{direct_line} | {line.strip()}"
+    return direct_line
 
 
 def find_target_object(target_root, target_hash, preferred_prefix, out_dir, compact):
