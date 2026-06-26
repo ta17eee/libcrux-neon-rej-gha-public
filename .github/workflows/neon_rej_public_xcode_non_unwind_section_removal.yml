@@ -359,6 +359,95 @@ jobs:
             printf '%s\n' "$?"
           }
 
+          zero_object_symbols() {
+            local variant="$1"
+            local zero_size="$2"
+            shift 2
+            local dir="$out_dir/objects/${variant}"
+            local output="$dir/selected-object.o"
+            mkdir -p "$dir"
+            xcrun llvm-nm -nm "$selected_obj" > "$dir/source.nm.txt" 2> "$dir/source.nm.err" || true
+            python3 - "$selected_obj" "$output" "$dir/source.nm.txt" "$zero_size" "$@" > "$dir/transform.log" 2>&1 <<'PY'
+          import re
+          import struct
+          import sys
+
+          src, dst, nm_path, zero_size, *targets = sys.argv[1:]
+          zero_size = int(zero_size, 0)
+          targets = set(targets)
+          data = bytearray(open(src, "rb").read())
+
+          def cstr(raw):
+              return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+          if len(data) < 32:
+              print("file too small for mach_header_64")
+              raise SystemExit(2)
+          magic, = struct.unpack_from("<I", data, 0)
+          if magic != 0xfeedfacf:
+              print(f"unexpected Mach-O magic 0x{magic:08x}")
+              raise SystemExit(2)
+
+          sections = []
+          ncmds, = struct.unpack_from("<I", data, 16)
+          off = 32
+          for _ in range(ncmds):
+              if off + 8 > len(data):
+                  print("truncated load command")
+                  raise SystemExit(2)
+              cmd, cmdsize = struct.unpack_from("<II", data, off)
+              if cmd == 0x19:  # LC_SEGMENT_64
+                  nsects, = struct.unpack_from("<I", data, off + 64)
+                  sec_off = off + 72
+                  for _ in range(nsects):
+                      sect = cstr(data[sec_off:sec_off + 16])
+                      seg = cstr(data[sec_off + 16:sec_off + 32])
+                      addr, size = struct.unpack_from("<QQ", data, sec_off + 32)
+                      file_offset, = struct.unpack_from("<I", data, sec_off + 48)
+                      sections.append((seg, sect, addr, size, file_offset))
+                      sec_off += 80
+              off += cmdsize
+
+          nm_re = re.compile(r"^([0-9a-fA-F]+) \(([^,]+),([^)]+)\) .* ([^ ]+)$")
+          symbols = {}
+          for line in open(nm_path, errors="replace"):
+              match = nm_re.match(line.strip())
+              if not match:
+                  continue
+              value = int(match.group(1), 16)
+              name = match.group(4)
+              if name in targets:
+                  symbols[name] = (value, match.group(2), match.group(3))
+
+          missing = sorted(targets - set(symbols))
+          if missing:
+              print("missing symbols: " + " ".join(missing))
+              raise SystemExit(44)
+
+          for name, (value, sym_seg, sym_sect) in sorted(symbols.items()):
+              candidates = [
+                  s for s in sections
+                  if s[0] == sym_seg and s[1] == sym_sect and s[2] <= value < s[2] + s[3]
+              ]
+              if not candidates:
+                  print(f"{name}: no containing section for value=0x{value:x} {sym_seg},{sym_sect}")
+                  raise SystemExit(2)
+              seg, sect, addr, size, file_offset = candidates[0]
+              rel = value - addr
+              start = file_offset + rel
+              end = start + zero_size
+              if rel + zero_size > size or end > len(data):
+                  print(f"{name}: zero range out of section/file value=0x{value:x} rel={rel} size={zero_size}")
+                  raise SystemExit(2)
+              data[start:end] = b"\0" * zero_size
+              print(f"zeroed {name} {seg},{sect} value=0x{value:x} file_offset={start} size={zero_size}")
+
+          with open(dst, "wb") as f:
+              f.write(data)
+          PY
+            printf '%s\n' "$?"
+          }
+
           link_with_ld() {
             local object_variant="$1"
             local object_path="$2"
@@ -567,6 +656,38 @@ jobs:
 
           status="$(zero_object_sections zero_all_literals "__TEXT,__literal4" "__TEXT,__literal8" "__TEXT,__literal16")"
           make_and_link_variant zero_all_literals "zero:__TEXT,__literal4 __TEXT,__literal8 __TEXT,__literal16" "$status"
+
+          case "$label" in
+            "0c67 ordinary")
+              near_literal_a="lCPI203_1"
+              near_literal_b="lCPI203_2"
+              ;;
+            "0c67 plus-neon")
+              near_literal_a="lCPI210_1"
+              near_literal_b="lCPI210_2"
+              ;;
+            "b9fa ordinary"|"b9fa plus-neon")
+              near_literal_a="lCPI4_0"
+              near_literal_b=""
+              ;;
+            *)
+              near_literal_a=""
+              near_literal_b=""
+              ;;
+          esac
+
+          if [ -n "$near_literal_a" ]; then
+            status="$(zero_object_symbols zero_near_literal_a 16 "$near_literal_a")"
+            make_and_link_variant zero_near_literal_a "zero-symbol:${near_literal_a}:16" "$status"
+          fi
+
+          if [ -n "$near_literal_b" ]; then
+            status="$(zero_object_symbols zero_near_literal_b 16 "$near_literal_b")"
+            make_and_link_variant zero_near_literal_b "zero-symbol:${near_literal_b}:16" "$status"
+
+            status="$(zero_object_symbols zero_near_literals_pair 16 "$near_literal_a" "$near_literal_b")"
+            make_and_link_variant zero_near_literals_pair "zero-symbol:${near_literal_a},${near_literal_b}:16" "$status"
+          fi
 
           status="$(zero_object_sections zero_text_const "__TEXT,__const")"
           make_and_link_variant zero_text_const "zero:__TEXT,__const" "$status"
