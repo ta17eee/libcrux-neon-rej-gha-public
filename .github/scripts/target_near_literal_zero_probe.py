@@ -159,6 +159,27 @@ def symbols_with_prefix(src, prefix):
     return sorted(names, key=lambda s: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", s)])
 
 
+def cpi_subsets(prefix, symbols):
+    if not symbols:
+        return []
+    n = len(symbols)
+    cuts = {
+        "first_half": (0, (n + 1) // 2),
+        "second_half": ((n + 1) // 2, n),
+        "q1": (0, (n + 3) // 4),
+        "q2": ((n + 3) // 4, (n + 1) // 2),
+        "q3": ((n + 1) // 2, (3 * n + 3) // 4),
+        "q4": ((3 * n + 3) // 4, n),
+    }
+    out = []
+    for label, (lo, hi) in cuts.items():
+        subset = symbols[lo:hi]
+        if subset:
+            out.append((f"zero_{prefix}{label}", subset))
+    out.append((f"zero_{prefix}all", symbols))
+    return out
+
+
 def add_hex(a, b):
     return int(a, 16) + int(b, 16)
 
@@ -330,10 +351,11 @@ def main():
     cpi_symbols = symbols_with_prefix(selected, cfg["cpi_prefix"])
     if cpi_symbols:
         (obj_dir / "cpi-prefix-symbols.txt").write_text("\n".join(cpi_symbols) + "\n")
-        dst = obj_dir / "zero_cpi_prefix.o"
-        log = obj_dir / "zero_cpi_prefix.log"
-        status = zero_symbols(selected, dst, cpi_symbols, 16, log)
-        variants.append((f"zero_{cfg['cpi_prefix']}all", dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, subset_symbols in cpi_subsets(cfg["cpi_prefix"], cpi_symbols):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = zero_symbols(selected, dst, subset_symbols, 16, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     for variant, obj_path, transform_status, transform_log in variants:
         if transform_status != 0 or not Path(obj_path).exists():
