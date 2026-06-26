@@ -139,6 +139,9 @@ jobs:
             DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
             DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objcopy || true
             DEVELOPER_DIR="${developer_dir}" xcrun llvm-objcopy --version || true
+            command -v llvm-objcopy || true
+            /opt/homebrew/opt/llvm/bin/llvm-objcopy --version || true
+            /usr/local/opt/llvm/bin/llvm-objcopy --version || true
             DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
             DEVELOPER_DIR="${developer_dir}" ld -v || true
             DEVELOPER_DIR="${developer_dir}" ld -version_details || true
@@ -274,8 +277,11 @@ jobs:
             done
             if [ "${#args[@]}" -eq 0 ]; then
               cp "$selected_obj" "$output" > "$out_dir/objects/${variant}/transform.log" 2>&1
+            elif [ -n "${objcopy_tool}" ]; then
+              "$objcopy_tool" "${args[@]}" "$selected_obj" "$output" > "$out_dir/objects/${variant}/transform.log" 2>&1
             else
-              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objcopy "${args[@]}" "$selected_obj" "$output" > "$out_dir/objects/${variant}/transform.log" 2>&1
+              echo "llvm-objcopy not found via xcrun, PATH, /opt/homebrew/opt/llvm, or /usr/local/opt/llvm" > "$out_dir/objects/${variant}/transform.log"
+              return 127
             fi
             printf '%s\n' "$?"
           }
@@ -436,6 +442,16 @@ jobs:
           compiler_builtins="$(ls "$rustlib"/libcompiler_builtins-*.rlib | head -n 1)"
           sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
           build_rustflags="-C save-temps ${target_feature_flags}"
+          objcopy_tool=""
+          if DEVELOPER_DIR="${developer_dir}" xcrun --find llvm-objcopy > "$out_dir/xcrun-llvm-objcopy-path.txt" 2>/dev/null; then
+            objcopy_tool="$(cat "$out_dir/xcrun-llvm-objcopy-path.txt")"
+          elif command -v llvm-objcopy > "$out_dir/path-llvm-objcopy-path.txt" 2>/dev/null; then
+            objcopy_tool="$(cat "$out_dir/path-llvm-objcopy-path.txt")"
+          elif [ -x /opt/homebrew/opt/llvm/bin/llvm-objcopy ]; then
+            objcopy_tool="/opt/homebrew/opt/llvm/bin/llvm-objcopy"
+          elif [ -x /usr/local/opt/llvm/bin/llvm-objcopy ]; then
+            objcopy_tool="/usr/local/opt/llvm/bin/llvm-objcopy"
+          fi
 
           DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
             cargo +1.78.0 test ${cargo_args} \
@@ -452,6 +468,7 @@ jobs:
             echo "- selected_obj: \`${selected_obj:-missing}\`"
             echo "- compiler_builtins: \`${compiler_builtins:-missing}\`"
             echo "- sdkroot: \`${sdkroot:-missing}\`"
+            echo "- objcopy_tool: \`${objcopy_tool:-missing}\`"
             echo
             echo "## Build log tail"
             echo
