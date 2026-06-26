@@ -297,6 +297,56 @@ jobs:
             printf '%s\n' "$?"
           }
 
+          zero_object_sections() {
+            local variant="$1"
+            shift
+            local dir="$out_dir/objects/${variant}"
+            local output="$dir/selected-object.o"
+            mkdir -p "$dir"
+            otool -l "$selected_obj" > "$dir/source.otool-load-commands.txt" 2>&1 || true
+            local args=()
+            local section section_size zero_file safe_name
+            for section in "$@"; do
+              section_size="$(python3 - "$dir/source.otool-load-commands.txt" "$section" <<'PY'
+          import sys
+          path, target = sys.argv[1:]
+          target_seg, target_sect = target.split(",", 1)
+          cur = {}
+          for line in open(path, errors="replace"):
+              parts = line.strip().split()
+              if len(parts) >= 2 and parts[0] == "sectname":
+                  cur = {"sect": parts[1]}
+              elif len(parts) >= 2 and parts[0] == "segname" and cur:
+                  cur["seg"] = parts[1]
+              elif len(parts) >= 2 and parts[0] == "size" and cur:
+                  cur["size"] = parts[1]
+              elif len(parts) >= 2 and parts[0] == "flags" and cur:
+                  if cur.get("seg") == target_seg and cur.get("sect") == target_sect:
+                      print(cur.get("size", "missing"))
+                      raise SystemExit(0)
+                  cur = {}
+          print("missing")
+          PY
+              )"
+              if ! printf '%s' "$section_size" | grep -Eq '^0x[0-9a-fA-F]+$'; then
+                echo "missing section ${section}" > "$dir/transform.log"
+                printf '%s\n' 44
+                return 0
+              fi
+              safe_name="$(printf '%s' "$section" | tr ',/' '__')"
+              zero_file="$dir/zero-${safe_name}.bin"
+              python3 - "$section_size" "$zero_file" <<'PY'
+          import sys
+          size = int(sys.argv[1], 16)
+          with open(sys.argv[2], "wb") as f:
+              f.write(b"\0" * size)
+          PY
+              args+=(--update-section="${section}=${zero_file}")
+            done
+            "$objcopy_tool" "${args[@]}" "$selected_obj" "$output" > "$dir/transform.log" 2>&1
+            printf '%s\n' "$?"
+          }
+
           link_with_ld() {
             local object_variant="$1"
             local object_path="$2"
@@ -490,6 +540,33 @@ jobs:
 
           status="$(transform_object original)"
           make_and_link_variant original none "$status"
+
+          status="$(zero_object_sections zero_gcc_except_tab "__TEXT,__gcc_except_tab")"
+          make_and_link_variant zero_gcc_except_tab "zero:__TEXT,__gcc_except_tab" "$status"
+
+          status="$(zero_object_sections zero_literal4 "__TEXT,__literal4")"
+          make_and_link_variant zero_literal4 "zero:__TEXT,__literal4" "$status"
+
+          status="$(zero_object_sections zero_literal8 "__TEXT,__literal8")"
+          make_and_link_variant zero_literal8 "zero:__TEXT,__literal8" "$status"
+
+          status="$(zero_object_sections zero_literal16 "__TEXT,__literal16")"
+          make_and_link_variant zero_literal16 "zero:__TEXT,__literal16" "$status"
+
+          status="$(zero_object_sections zero_all_literals "__TEXT,__literal4" "__TEXT,__literal8" "__TEXT,__literal16")"
+          make_and_link_variant zero_all_literals "zero:__TEXT,__literal4 __TEXT,__literal8 __TEXT,__literal16" "$status"
+
+          status="$(zero_object_sections zero_text_const "__TEXT,__const")"
+          make_and_link_variant zero_text_const "zero:__TEXT,__const" "$status"
+
+          status="$(zero_object_sections zero_data_const "__DATA,__const")"
+          make_and_link_variant zero_data_const "zero:__DATA,__const" "$status"
+
+          status="$(zero_object_sections zero_text_data_const "__TEXT,__const" "__DATA,__const")"
+          make_and_link_variant zero_text_data_const "zero:__TEXT,__const __DATA,__const" "$status"
+
+          status="$(zero_object_sections zero_thread_vars "__DATA,__thread_vars")"
+          make_and_link_variant zero_thread_vars "zero:__DATA,__thread_vars" "$status"
 
           status="$(transform_object remove_gcc_except_tab "__TEXT,__gcc_except_tab")"
           make_and_link_variant remove_gcc_except_tab "__TEXT,__gcc_except_tab" "$status"
