@@ -356,6 +356,8 @@ jobs:
               final_expected_count="$(count_bytes "$bin" "$expected_bytes")"
               final_corrupt_count="$(count_bytes "$bin" "$corrupt_bytes")"
             fi
+            object_line_tsv="${object_line//$'\t'/ }"
+            final_line_tsv="${final_line//$'\t'/ }"
             {
               echo "## ${object_variant} / ${link_variant}"
               echo
@@ -403,7 +405,7 @@ jobs:
             } >> "$summary"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$label" "$object_variant" "$transform_kind" "$transform_status" "$link_variant" "$link_status" \
-              "$object_line" "$final_line" "$object_sha" "$final_sha" "$dwarf_sections" \
+              "$object_line_tsv" "$final_line_tsv" "$object_sha" "$final_sha" "$dwarf_sections" \
               "$text_relocs" "$debug_info_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" \
               "$object_expected_count" "$object_corrupt_count" "$final_expected_count" "$final_corrupt_count" >> "$rows"
           }
