@@ -97,6 +97,7 @@ jobs:
         id: install_toolchain
         run: |
           rustup toolchain install 1.78.0
+          rustup component add llvm-tools-preview --toolchain 1.78.0
 
       - name: Remove unwind sections and direct-link
         if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
@@ -142,6 +143,9 @@ jobs:
             command -v llvm-objcopy || true
             /opt/homebrew/opt/llvm/bin/llvm-objcopy --version || true
             /usr/local/opt/llvm/bin/llvm-objcopy --version || true
+            rust_sysroot="$(rustc +1.78.0 --print sysroot)"
+            rust_host="$(rustc +1.78.0 -vV | awk '/^host:/ { print $2 }')"
+            "${rust_sysroot}/lib/rustlib/${rust_host}/bin/llvm-objcopy" --version || true
             DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
             DEVELOPER_DIR="${developer_dir}" ld -v || true
             DEVELOPER_DIR="${developer_dir}" ld -version_details || true
@@ -281,7 +285,8 @@ jobs:
               "$objcopy_tool" "${args[@]}" "$selected_obj" "$output" > "$out_dir/objects/${variant}/transform.log" 2>&1
             else
               echo "llvm-objcopy not found via xcrun, PATH, /opt/homebrew/opt/llvm, or /usr/local/opt/llvm" > "$out_dir/objects/${variant}/transform.log"
-              return 127
+              printf '%s\n' 127
+              return 0
             fi
             printf '%s\n' "$?"
           }
@@ -451,6 +456,12 @@ jobs:
             objcopy_tool="/opt/homebrew/opt/llvm/bin/llvm-objcopy"
           elif [ -x /usr/local/opt/llvm/bin/llvm-objcopy ]; then
             objcopy_tool="/usr/local/opt/llvm/bin/llvm-objcopy"
+          else
+            rust_host="$(rustc +1.78.0 -vV | awk '/^host:/ { print $2 }')"
+            rust_objcopy="$(rustc +1.78.0 --print sysroot)/lib/rustlib/${rust_host}/bin/llvm-objcopy"
+            if [ -x "$rust_objcopy" ]; then
+              objcopy_tool="$rust_objcopy"
+            fi
           fi
 
           DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
