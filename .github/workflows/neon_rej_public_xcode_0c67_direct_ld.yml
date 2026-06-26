@@ -1,0 +1,427 @@
+name: NEON rejection sampler public Xcode 0c67 direct ld
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  direct-ld:
+    name: 0c67 direct ld ${{ matrix.mode.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build saved object and link with direct ld
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode.label }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          test_filter="kyber1024_nist_known_answer_tests"
+          crate_dir="$PWD/libcrux-ml-kem"
+          target_root="$PWD/target/release"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-direct-ld-${mode}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# 0c67 direct Apple ld probe"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'mode\tvariant\tlink_status\trun_status\tobject_line\tfinal_line\tobject_sha256\tfinal_sha256\tlinker\tlto_arg\tclassic\n' > "$rows"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in "$target_root"/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find "$target_root" -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local out_file="$3"
+            local symbol_addr target_addr dis_file
+            dis_file="$out_dir/${kind}.disassembly.txt"
+            nm -nm "$path" > "$out_dir/${kind}.nm.txt" 2>&1
+            symbol_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/${kind}.nm.txt")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 10)
+                  hi = min(len(lines), i + 11)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf '%s\tmissing_xcode\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\n' "$mode" >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          rustlib="$(rustc +1.78.0 --print target-libdir)"
+          compiler_builtins="$(ls "$rustlib"/libcompiler_builtins-*.rlib | head -n 1)"
+          sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
+          lto_library="${developer_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib"
+          build_rustflags="-C save-temps ${target_feature_flags}"
+
+          DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml \
+              --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          selected_bin="$(find_test_binary || true)"
+          selected_obj="$(find_target_object || true)"
+          object_line="missing"
+          object_sha256="NA"
+          if [ "$build_status" -eq 0 ] && [ -n "$selected_obj" ]; then
+            object_sha256="$(shasum -a 256 "$selected_obj" | awk '{print $1}')"
+            target_line object "$selected_obj" "$out_dir/object.target-line.txt"
+            object_line="$(cat "$out_dir/object.target-line.txt")"
+          fi
+
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${build_rustflags}\`"
+            echo "- build_status: \`${build_status}\`"
+            echo "- selected_bin: \`${selected_bin:-missing}\`"
+            echo "- selected_obj: \`${selected_obj:-missing}\`"
+            echo "- compiler_builtins: \`${compiler_builtins:-missing}\`"
+            echo "- sdkroot: \`${sdkroot:-missing}\`"
+            echo "- lto_library: \`${lto_library}\`"
+            echo "- object_sha256: \`${object_sha256}\`"
+            echo "- object target: \`${object_line}\`"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object.target-line.txt.window" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Build log tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 120 "$out_dir/build.log" || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -ne 0 ] || [ -z "$selected_obj" ] || [ -z "$compiler_builtins" ]; then
+            printf '%s\tbuild_or_lookup_failed\tNA\tNA\t%s\tmissing\t%s\tNA\tNA\tNA\tNA\n' "$mode" "$object_line" "$object_sha256" >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          link_with_cc() {
+            local label="$1"
+            local extra="$2"
+            local link_dir="$out_dir/${label}"
+            local bin="$link_dir/nistkats.${label}"
+            local map="$link_dir/nistkats.${label}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -arch arm64
+              -nodefaultlibs
+              -o "$bin"
+              "$selected_obj"
+              "$compiler_builtins"
+              -L "$target_root/deps"
+              -L "$rustlib"
+              -liconv
+              -lSystem
+              -lc
+              -lm
+              -Wl,-dead_strip
+              -Wl,-map,"$map"
+            )
+            if [ -n "$extra" ]; then
+              read -r -a parsed_extra <<< "$extra"
+              args+=("${parsed_extra[@]}")
+            fi
+            DEVELOPER_DIR="${developer_dir}" xcrun cc -### "${args[@]}" > "$link_dir/cc-dash.log" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun cc "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          link_with_ld() {
+            local label="$1"
+            local use_lto="$2"
+            local use_classic="$3"
+            local link_dir="$out_dir/${label}"
+            local bin="$link_dir/nistkats.${label}"
+            local map="$link_dir/nistkats.${label}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -demangle
+              -dynamic
+              -arch arm64
+              -platform_version macos 14.0.0 14.0
+              -syslibroot "$sdkroot"
+              -o "$bin"
+              -L "$target_root/deps"
+              -L "$rustlib"
+              -L /usr/local/lib
+              "$selected_obj"
+              "$compiler_builtins"
+              -liconv
+              -lSystem
+              -lc
+              -lm
+              -dead_strip
+              -map "$map"
+            )
+            if [ "$use_lto" = "yes" ]; then
+              args=(-lto_library "$lto_library" "${args[@]}")
+            fi
+            if [ "$use_classic" = "yes" ]; then
+              args+=(-ld_classic)
+            fi
+            {
+              printf 'DEVELOPER_DIR=%q xcrun ld' "$developer_dir"
+              printf ' %q' "${args[@]}"
+              echo
+            } > "$link_dir/ld-command.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun ld "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          record_variant() {
+            local label="$1"
+            local bin="$2"
+            local status="$3"
+            local linker="$4"
+            local lto_arg="$5"
+            local classic="$6"
+            local link_dir="$out_dir/${label}"
+            local run_status="NA"
+            local final_line="missing"
+            local final_sha="NA"
+            if [ "$status" -eq 0 ]; then
+              final_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
+              target_line "${label}-final" "$bin" "$link_dir/final.target-line.txt"
+              final_line="$(cat "$link_dir/final.target-line.txt")"
+              ( cd "$crate_dir" && run_with_timeout 90 "$bin" "$test_filter" --exact --nocapture ) > "$link_dir/run.log" 2>&1
+              run_status=$?
+            fi
+            {
+              echo "## Variant: ${label}"
+              echo
+              echo "- linker: \`${linker}\`"
+              echo "- lto_arg: \`${lto_arg}\`"
+              echo "- classic: \`${classic}\`"
+              echo "- link_status: \`${status}\`"
+              echo "- run_status: \`${run_status}\`"
+              echo "- final_sha256: \`${final_sha}\`"
+              echo "- final target: \`${final_line}\`"
+              echo
+              echo "### final target window"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/final.target-line.txt.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### link command"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/ld-command.txt" "$link_dir/cc-dash.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/link.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### run log tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$link_dir/run.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$mode" "$label" "$status" "$run_status" "$object_line" "$final_line" \
+              "$object_sha256" "$final_sha" "$linker" "$lto_arg" "$classic" >> "$rows"
+          }
+
+          cc_bin="$(link_with_cc cc_new_final "")"
+          cc_status="$(cat "$out_dir/cc_new_final/status.txt")"
+          record_variant cc_new_final "$cc_bin" "$cc_status" cc yes no
+
+          cc_classic_bin="$(link_with_cc cc_classic_final "-Wl,-ld_classic")"
+          cc_classic_status="$(cat "$out_dir/cc_classic_final/status.txt")"
+          record_variant cc_classic_final "$cc_classic_bin" "$cc_classic_status" cc yes yes
+
+          ld_lto_bin="$(link_with_ld ld_new_with_lto yes no)"
+          ld_lto_status="$(cat "$out_dir/ld_new_with_lto/status.txt")"
+          record_variant ld_new_with_lto "$ld_lto_bin" "$ld_lto_status" ld yes no
+
+          ld_no_lto_bin="$(link_with_ld ld_new_no_lto no no)"
+          ld_no_lto_status="$(cat "$out_dir/ld_new_no_lto/status.txt")"
+          record_variant ld_new_no_lto "$ld_no_lto_bin" "$ld_no_lto_status" ld no no
+
+          ld_classic_lto_bin="$(link_with_ld ld_classic_with_lto yes yes)"
+          ld_classic_lto_status="$(cat "$out_dir/ld_classic_with_lto/status.txt")"
+          record_variant ld_classic_with_lto "$ld_classic_lto_bin" "$ld_classic_lto_status" ld yes yes
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-direct-ld-${{ matrix.mode.label }}
+          path: neon-rej-diagnostics/**
