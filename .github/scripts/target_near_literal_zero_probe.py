@@ -236,6 +236,26 @@ def transform_cpi01_pair(src, dst, s0, s1, mode, log_path):
         new0, new1 = v0, v0
     elif mode == "duplicate_1":
         new0, new1 = v1, v1
+    elif mode == "both_ff":
+        new0 = b"\xff" * 16
+        new1 = b"\xff" * 16
+    elif mode == "both_00_0f":
+        new0 = bytes(range(16))
+        new1 = bytes(range(16))
+    elif mode == "zero_ff":
+        new0 = b"\0" * 16
+        new1 = b"\xff" * 16
+    elif mode == "ff_zero":
+        new0 = b"\xff" * 16
+        new1 = b"\0" * 16
+    elif mode == "duplicate_0_flip_s1_last":
+        s1_mut = bytearray(v0)
+        s1_mut[-1] ^= 1
+        new0, new1 = v0, bytes(s1_mut)
+    elif mode == "duplicate_1_flip_s0_last":
+        s0_mut = bytearray(v1)
+        s0_mut[-1] ^= 1
+        new0, new1 = bytes(s0_mut), v1
     else:
         Path(log_path).write_text(f"unknown transform mode: {mode}\n")
         return 2
@@ -424,6 +444,12 @@ def cpi_pair_transforms(prefix, symbols, mode):
         "swap_last_word",
         "duplicate_0",
         "duplicate_1",
+        "both_ff",
+        "both_00_0f",
+        "zero_ff",
+        "ff_zero",
+        "duplicate_0_flip_s1_last",
+        "duplicate_1_flip_s0_last",
     ]
     return [(f"{prefix}cpi01_{m}", s0, s1, m) for m in modes]
 
