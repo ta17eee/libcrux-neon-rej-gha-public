@@ -141,6 +141,24 @@ def zero_section(src, dst, section_name, log_path):
     return 0
 
 
+def symbols_with_prefix(src, prefix):
+    if not prefix:
+        return []
+    nm_out = output(["xcrun", "llvm-nm", "-nm", str(src)])
+    nm_re = re.compile(r"^([0-9a-fA-F]+) \(([^,]+),([^)]+)\) .* ([^ ]+)$")
+    names = []
+    for line in nm_out.splitlines():
+        match = nm_re.match(line.strip())
+        if not match:
+            continue
+        name = match.group(4)
+        seg = match.group(2)
+        sect = match.group(3)
+        if name.startswith(prefix) and seg == "__TEXT" and sect == "__literal16":
+            names.append(name)
+    return sorted(names, key=lambda s: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", s)])
+
+
 def add_hex(a, b):
     return int(a, 16) + int(b, 16)
 
@@ -241,6 +259,7 @@ def main():
         "expected_bytes": os.environ["PROBE_EXPECTED_BYTES"],
         "corrupt_bytes": os.environ["PROBE_CORRUPT_BYTES"],
         "near_literals": [s for s in os.environ["PROBE_NEAR_LITERALS"].split(",") if s],
+        "cpi_prefix": os.environ.get("PROBE_CPI_PREFIX", ""),
         "developer_dir": "/Applications/Xcode_15.0.1.app/Contents/Developer",
         "target_root": str(Path.cwd() / "target" / "release"),
     }
@@ -307,6 +326,14 @@ def main():
         log = obj_dir / "zero_near_literals_pair.log"
         status = zero_symbols(selected, dst, cfg["near_literals"], 16, log)
         variants.append(("zero_near_literals_pair", dst, status, log.read_text(errors="replace").strip()))
+
+    cpi_symbols = symbols_with_prefix(selected, cfg["cpi_prefix"])
+    if cpi_symbols:
+        (obj_dir / "cpi-prefix-symbols.txt").write_text("\n".join(cpi_symbols) + "\n")
+        dst = obj_dir / "zero_cpi_prefix.o"
+        log = obj_dir / "zero_cpi_prefix.log"
+        status = zero_symbols(selected, dst, cpi_symbols, 16, log)
+        variants.append((f"zero_{cfg['cpi_prefix']}all", dst, status, log.read_text(errors="replace").strip()))
 
     for variant, obj_path, transform_status, transform_log in variants:
         if transform_status != 0 or not Path(obj_path).exists():

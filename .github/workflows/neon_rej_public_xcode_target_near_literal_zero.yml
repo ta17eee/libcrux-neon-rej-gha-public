@@ -26,6 +26,7 @@ jobs:
             expected_bytes: "fc 03 03 aa"
             corrupt_bytes: "fc 0f 01 aa"
             near_literals: "lCPI203_1,lCPI203_2"
+            cpi_prefix: "lCPI203_"
           - label: 0c67 plus-neon
             artifact_suffix: 0c67-plus-neon
             ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
@@ -37,6 +38,7 @@ jobs:
             expected_bytes: "fc 03 03 aa"
             corrupt_bytes: "fc 7f 00 aa"
             near_literals: "lCPI210_1,lCPI210_2"
+            cpi_prefix: "lCPI210_"
           - label: b9fa ordinary
             artifact_suffix: b9fa-ordinary
             ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
@@ -48,6 +50,7 @@ jobs:
             expected_bytes: "85 fc ff 17"
             corrupt_bytes: "85 f0 c2 17"
             near_literals: "lCPI4_0"
+            cpi_prefix: ""
           - label: b9fa plus-neon
             artifact_suffix: b9fa-plus-neon
             ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
@@ -59,6 +62,7 @@ jobs:
             expected_bytes: "85 fc ff 17"
             corrupt_bytes: "85 c0 c2 17"
             near_literals: "lCPI4_0"
+            cpi_prefix: ""
 
     steps:
       - name: Checkout probe repository
@@ -120,6 +124,7 @@ jobs:
           PROBE_EXPECTED_BYTES: ${{ matrix.probe.expected_bytes }}
           PROBE_CORRUPT_BYTES: ${{ matrix.probe.corrupt_bytes }}
           PROBE_NEAR_LITERALS: ${{ matrix.probe.near_literals }}
+          PROBE_CPI_PREFIX: ${{ matrix.probe.cpi_prefix }}
         run: |
           python3 ../probe-repo/.github/scripts/target_near_literal_zero_probe.py
 
