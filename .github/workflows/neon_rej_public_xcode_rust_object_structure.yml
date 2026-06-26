@@ -1,0 +1,319 @@
+name: NEON rejection sampler public Xcode Rust object structure
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  rust-object-structure:
+    name: ${{ matrix.probe.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        probe:
+          - label: 0c67 ordinary
+            artifact_suffix: 0c67-ordinary
+            ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run
+            binary_glob: nistkats-*
+            preferred_object_glob: nistkats-*
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            target_feature_flags: ""
+          - label: 0c67 plus-neon
+            artifact_suffix: 0c67-plus-neon
+            ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --test nistkats --no-run
+            binary_glob: nistkats-*
+            preferred_object_glob: nistkats-*
+            target_hash: h8997d6f42564fb09
+            target_offset_hex: "0x2d3c"
+            target_feature_flags: "-C target_feature=+neon"
+          - label: b9fa ordinary
+            artifact_suffix: b9fa-ordinary
+            ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --no-run
+            binary_glob: libcrux_ml_kem-*
+            preferred_object_glob: libcrux_ml_kem-*
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            target_feature_flags: ""
+          - label: b9fa plus-neon
+            artifact_suffix: b9fa-plus-neon
+            ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+            cargo_args: --manifest-path libcrux-ml-kem/Cargo.toml --verbose --release --no-run
+            binary_glob: libcrux_ml_kem-*
+            preferred_object_glob: libcrux_ml_kem-*
+            target_hash: hda4635a55fb002f6
+            target_offset_hex: "0x1514"
+            target_feature_flags: "-C target_feature=+neon"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: ${{ matrix.probe.ref }}
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Collect Rust Mach-O object structure
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          label="${{ matrix.probe.label }}"
+          commit="${{ matrix.probe.ref }}"
+          cargo_args="${{ matrix.probe.cargo_args }}"
+          target_feature_flags="${{ matrix.probe.target_feature_flags }}"
+          binary_glob="${{ matrix.probe.binary_glob }}"
+          preferred_object_glob="${{ matrix.probe.preferred_object_glob }}"
+          target_hash="${{ matrix.probe.target_hash }}"
+          target_offset_hex="${{ matrix.probe.target_offset_hex }}"
+          target_root="$PWD/target/release"
+          out_dir="$PWD/neon-rej-diagnostics/rust-object-${{ matrix.probe.artifact_suffix }}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# Rust Mach-O object structure probe"
+            echo
+            echo "Label: \`${label}\`"
+            echo "Commit: \`${commit}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Target hash: \`${target_hash}\`"
+            echo "Target offset: \`${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find clang || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'label\tbuild_status\tselected_object\tobject_sha256\tobject_size\tobject_line\thas_compact_unwind\thas_eh_frame\thas_unwind_info\ttext_relocs\tcompact_unwind_relocs\teh_frame_relocs\n' > "$rows"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  ${preferred_object_glob}) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find "$target_root" -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local path="$1"
+            local out_file="$2"
+            local symbol_addr target_addr dis_file
+            dis_file="$out_dir/selected-object.disassembly.txt"
+            nm -nm "$path" > "$out_dir/selected-object.nm.txt" 2>&1
+            symbol_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/selected-object.nm.txt")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 16)
+                  hi = min(len(lines), i + 17)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          dump_object() {
+            local obj="$1"
+            cp "$obj" "$out_dir/selected-object.o"
+            file "$out_dir/selected-object.o" > "$out_dir/selected-object.file.txt" 2>&1 || true
+            ls -lh "$out_dir/selected-object.o" > "$out_dir/selected-object.ls.txt" 2>&1 || true
+            shasum -a 256 "$out_dir/selected-object.o" > "$out_dir/selected-object.sha256.txt" 2>&1 || true
+            nm -nm "$out_dir/selected-object.o" > "$out_dir/selected-object.nm.txt" 2>&1 || true
+            nm -m "$out_dir/selected-object.o" > "$out_dir/selected-object.nm-m.txt" 2>&1 || true
+            size -m "$out_dir/selected-object.o" > "$out_dir/selected-object.size-m.txt" 2>&1 || true
+            otool -hv "$out_dir/selected-object.o" > "$out_dir/selected-object.otool-header.txt" 2>&1 || true
+            otool -l "$out_dir/selected-object.o" > "$out_dir/selected-object.otool-load-commands.txt" 2>&1 || true
+            otool -r "$out_dir/selected-object.o" > "$out_dir/selected-object.otool-relocs.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --headers "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-headers.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --private-headers "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-private-headers.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --section-headers "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-section-headers.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --all-headers "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-all-headers.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --reloc "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-relocs.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --syms "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-syms.txt" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --unwind-info "$out_dir/selected-object.o" > "$out_dir/selected-object.objdump-unwind-info.txt" 2>&1 || true
+            target_line "$out_dir/selected-object.o" "$out_dir/selected-object.target-line.txt"
+          }
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf '%s\tmissing_xcode\tmissing\tNA\tNA\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\n' "$label" >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          build_rustflags="-C save-temps ${target_feature_flags}"
+          DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
+            cargo +1.78.0 test ${cargo_args} \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          selected_obj="$(find_target_object || true)"
+          object_sha="NA"
+          object_size="NA"
+          object_line="missing"
+          has_compact_unwind="NA"
+          has_eh_frame="NA"
+          has_unwind_info="NA"
+          text_relocs="NA"
+          compact_unwind_relocs="NA"
+          eh_frame_relocs="NA"
+
+          if [ "$build_status" -eq 0 ] && [ -n "$selected_obj" ]; then
+            dump_object "$selected_obj"
+            object_sha="$(awk '{print $1}' "$out_dir/selected-object.sha256.txt")"
+            object_size="$(stat -f '%z' "$out_dir/selected-object.o")"
+            object_line="$(cat "$out_dir/selected-object.target-line.txt")"
+            has_compact_unwind="$(grep -c '__compact_unwind' "$out_dir/selected-object.otool-load-commands.txt" || true)"
+            has_eh_frame="$(grep -c '__eh_frame' "$out_dir/selected-object.otool-load-commands.txt" || true)"
+            has_unwind_info="$(grep -c '__unwind_info' "$out_dir/selected-object.otool-load-commands.txt" || true)"
+            text_relocs="$(awk '/relocation information for __TEXT,__text/{flag=1; next} /^relocation information for/{flag=0} flag && NF {n++} END {print n+0}' "$out_dir/selected-object.objdump-relocs.txt")"
+            compact_unwind_relocs="$(awk '/relocation information for __LD,__compact_unwind/{flag=1; next} /^relocation information for/{flag=0} flag && NF {n++} END {print n+0}' "$out_dir/selected-object.objdump-relocs.txt")"
+            eh_frame_relocs="$(awk '/relocation information for __TEXT,__eh_frame/{flag=1; next} /^relocation information for/{flag=0} flag && NF {n++} END {print n+0}' "$out_dir/selected-object.objdump-relocs.txt")"
+          fi
+
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${build_rustflags}\`"
+            echo "- cargo args: \`${cargo_args}\`"
+            echo "- build_status: \`${build_status}\`"
+            echo "- selected_obj: \`${selected_obj:-missing}\`"
+            echo "- selected_object_sha256: \`${object_sha}\`"
+            echo "- selected_object_size: \`${object_size}\`"
+            echo "- target_line: \`${object_line}\`"
+            echo "- has __LD,__compact_unwind count: \`${has_compact_unwind}\`"
+            echo "- has __TEXT,__eh_frame count: \`${has_eh_frame}\`"
+            echo "- has __TEXT,__unwind_info count: \`${has_unwind_info}\`"
+            echo "- __TEXT,__text reloc rows: \`${text_relocs}\`"
+            echo "- __LD,__compact_unwind reloc rows: \`${compact_unwind_relocs}\`"
+            echo "- __TEXT,__eh_frame reloc rows: \`${eh_frame_relocs}\`"
+            echo
+            echo "## Object Candidates"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object-candidates.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Target Window"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/selected-object.target-line.txt.window" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Section Sizes"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/selected-object.size-m.txt" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Load Command Section Lines"
+            echo
+            echo "\`\`\`text"
+            grep -E 'sectname|segname|addr|size|offset|reloff|nreloc|flags' "$out_dir/selected-object.otool-load-commands.txt" 2>/dev/null || true
+            echo "\`\`\`"
+          } >> "$summary"
+
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$label" "$build_status" "${selected_obj:-missing}" "$object_sha" "$object_size" "$object_line" \
+            "$has_compact_unwind" "$has_eh_frame" "$has_unwind_info" \
+            "$text_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" >> "$rows"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-rust-object-structure-${{ matrix.probe.artifact_suffix }}
+          path: neon-rej-diagnostics/**
