@@ -1,0 +1,360 @@
+name: NEON rejection sampler public Xcode minimal CPI01 equality shape
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  minimal-cpi01-equality-shape:
+    name: minimal CPI01 equality shape
+    runs-on: macos-14
+
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Build and link minimal CPI equality assembly shapes
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/minimal-cpi01-equality-shape"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# Minimal CPI01 equality assembly-shape probe"
+            echo
+            echo "Developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find clang || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'case\tlink_variant\tlink_status\tobject_line\tfinal_line\tobject_expected_count\tfinal_expected_count\tfinal_corrupt_ordinary_count\tfinal_corrupt_plus_neon_count\tobject_sha256\tfinal_sha256\n' > "$rows"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf 'all\tmissing_xcode\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\n' >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
+          callee_asm="$out_dir/callee.s"
+          callee_obj="$out_dir/callee.o"
+
+          cat > "$callee_asm" <<'ASM'
+          .text
+          .p2align 2
+          .globl _SIMD128Vector_rej_sample
+          _SIMD128Vector_rej_sample:
+          ret
+          ASM
+
+          DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$callee_asm" -o "$callee_obj" > "$out_dir/callee.assemble.log" 2>&1
+          callee_status=$?
+
+          count_bytes() {
+            local path="$1"
+            local pattern="$2"
+            python3 - "$path" "$pattern" <<'PY'
+          import sys
+          path, pattern = sys.argv[1:]
+          try:
+              data = open(path, "rb").read()
+          except OSError:
+              print("NA")
+              raise SystemExit(0)
+          needle = bytes(int(x, 16) for x in pattern.split())
+          count = 0
+          start = 0
+          while True:
+              idx = data.find(needle, start)
+              if idx < 0:
+                  break
+              count += 1
+              start = idx + 1
+          print(count)
+          PY
+          }
+
+          target_line() {
+            local path="$1"
+            local symbol="$2"
+            local out_file="$3"
+            local nm_file="$out_file.nm.txt"
+            local dis_file="$out_file.window"
+            local symbol_addr start_addr stop_addr
+            nm -nm "$path" > "$nm_file" 2>&1
+            symbol_addr="$(awk -v s="$symbol" '$0 ~ s { print $1; exit }' "$nm_file")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            start_addr="$(python3 - "$symbol_addr" <<'PY'
+          import sys
+          print(hex(max(0, int(sys.argv[1], 16) - 0x60)))
+          PY
+          )"
+            stop_addr="$(python3 - "$symbol_addr" <<'PY'
+          import sys
+          print(hex(int(sys.argv[1], 16) + 0x60))
+          PY
+          )"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --disassemble \
+              --start-address="${start_addr}" --stop-address="${stop_addr}" \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$symbol_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          found = "missing"
+          for line in open(path, errors="replace"):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          make_case_asm() {
+            local case_name="$1"
+            local cpi0="$2"
+            local cpi1="$3"
+            local cpi2="$4"
+            local asm="$out_dir/${case_name}.s"
+            cat > "$asm" <<ASM
+          .text
+          .p2align 2
+          .globl _main
+          .private_extern _main
+          _main:
+          mov w0, #0
+          ret
+
+          .p2align 2
+          .globl _case_${case_name}
+          _case_${case_name}:
+          sub sp, sp, #64
+          adrp x9, L_${case_name}_cpi0@PAGE
+          add x9, x9, L_${case_name}_cpi0@PAGEOFF
+          ldr q0, [x9]
+          str q0, [sp]
+          .rept 32
+          nop
+          .endr
+          bl _SIMD128Vector_rej_sample
+          ldr x3, [sp]
+          adrp x7, L_${case_name}_cpi2@PAGE
+          add x7, x7, L_${case_name}_cpi2@PAGEOFF
+          ldr q2, [x7]
+          adrp x5, L_${case_name}_cpi1@PAGE
+          add x5, x5, L_${case_name}_cpi1@PAGEOFF
+          ldr q1, [x5]
+          .rept 4
+          nop
+          .endr
+          .globl _target_${case_name}
+          _target_${case_name}:
+          mov x28, x3
+          add sp, sp, #64
+          ret
+
+          .section __TEXT,__literal16,16byte_literals
+          .p2align 4
+          L_${case_name}_cpi0:
+          .quad ${cpi0%%,*}
+          .quad ${cpi0##*,}
+          L_${case_name}_cpi1:
+          .quad ${cpi1%%,*}
+          .quad ${cpi1##*,}
+          L_${case_name}_cpi2:
+          .quad ${cpi2%%,*}
+          .quad ${cpi2##*,}
+          ASM
+          }
+
+          assemble_case() {
+            local case_name="$1"
+            local obj="$out_dir/${case_name}.o"
+            DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$out_dir/${case_name}.s" -o "$obj" > "$out_dir/${case_name}.assemble.log" 2>&1
+            printf '%s\n' "$?" > "$out_dir/${case_name}.assemble.status"
+            if [ -f "$obj" ]; then
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --reloc "$obj" > "$out_dir/${case_name}.object.relocs.txt" 2>&1 || true
+              target_line "$obj" "_target_${case_name}" "$out_dir/${case_name}.object.target-line.txt"
+            fi
+          }
+
+          link_case() {
+            local case_name="$1"
+            local link_variant="$2"
+            local use_classic="$3"
+            local obj="$out_dir/${case_name}.o"
+            local link_dir="$out_dir/${case_name}.${link_variant}"
+            local bin="$link_dir/${case_name}.${link_variant}"
+            local map="$link_dir/${case_name}.${link_variant}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -demangle
+              -dynamic
+              -arch arm64
+              -platform_version macos 14.0.0 14.0
+              -syslibroot "$sdkroot"
+              -o "$bin"
+              "$obj"
+              "$callee_obj"
+              -lSystem
+              -lc
+              -u "_case_${case_name}"
+              -dead_strip
+              -map "$map"
+            )
+            if [ "$use_classic" = "yes" ]; then
+              args+=(-ld_classic)
+            fi
+            {
+              printf 'DEVELOPER_DIR=%q xcrun ld' "$developer_dir"
+              printf ' %q' "${args[@]}"
+              echo
+            } > "$link_dir/ld-command.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun ld "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          record_case() {
+            local case_name="$1"
+            local link_variant="$2"
+            local bin="$3"
+            local status="$4"
+            local obj="$out_dir/${case_name}.o"
+            local link_dir="$out_dir/${case_name}.${link_variant}"
+            local object_line final_line object_expected final_expected final_corrupt_ordinary final_corrupt_plus object_sha final_sha
+            object_line="$(cat "$out_dir/${case_name}.object.target-line.txt" 2>/dev/null || echo missing)"
+            object_expected="$(count_bytes "$obj" "fc 03 03 aa")"
+            object_sha="$(shasum -a 256 "$obj" 2>/dev/null | awk '{print $1}')"
+            final_line="missing"
+            final_expected="NA"
+            final_corrupt_ordinary="NA"
+            final_corrupt_plus="NA"
+            final_sha="NA"
+            if [ "$status" -eq 0 ]; then
+              target_line "$bin" "_target_${case_name}" "$link_dir/final.target-line.txt"
+              final_line="$(cat "$link_dir/final.target-line.txt")"
+              final_expected="$(count_bytes "$bin" "fc 03 03 aa")"
+              final_corrupt_ordinary="$(count_bytes "$bin" "fc 0f 01 aa")"
+              final_corrupt_plus="$(count_bytes "$bin" "fc 7f 00 aa")"
+              final_sha="$(shasum -a 256 "$bin" 2>/dev/null | awk '{print $1}')"
+            fi
+            {
+              echo "## ${case_name} / ${link_variant}"
+              echo
+              echo "- link_status: \`${status}\`"
+              echo "- object target: \`${object_line}\`"
+              echo "- final target: \`${final_line}\`"
+              echo "- object expected count: \`${object_expected}\`"
+              echo "- final expected count: \`${final_expected}\`"
+              echo "- final ordinary-corrupt count: \`${final_corrupt_ordinary}\`"
+              echo "- final plus-neon-corrupt count: \`${final_corrupt_plus}\`"
+              echo
+              echo "### final target window"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/final.target-line.txt.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/link.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$case_name" "$link_variant" "$status" "${object_line//$'\t'/ }" "${final_line//$'\t'/ }" \
+              "$object_expected" "$final_expected" "$final_corrupt_ordinary" "$final_corrupt_plus" \
+              "${object_sha:-NA}" "$final_sha" >> "$rows"
+          }
+
+          cpi0_orig="0xffffffffff020100,0xffffffffffffffff"
+          cpi1_orig="0x0504040302010100,0x0b0a0a0908070706"
+          cpi2_orig="0x0008000400020001,0x0080004000200010"
+          cpi_ff="0xffffffffffffffff,0xffffffffffffffff"
+          cpi_flip="0xffffffffff020100,0xfffffffffffffffe"
+
+          make_case_asm distinct "$cpi0_orig" "$cpi1_orig" "$cpi2_orig"
+          make_case_asm cpi01_dup0 "$cpi0_orig" "$cpi0_orig" "$cpi2_orig"
+          make_case_asm cpi01_both_ff "$cpi_ff" "$cpi_ff" "$cpi2_orig"
+          make_case_asm cpi01_flip "$cpi0_orig" "$cpi_flip" "$cpi2_orig"
+          make_case_asm cpi02_both_ff "$cpi_ff" "$cpi1_orig" "$cpi_ff"
+          make_case_asm cpi12_both_ff "$cpi0_orig" "$cpi_ff" "$cpi_ff"
+
+          for case_name in distinct cpi01_dup0 cpi01_both_ff cpi01_flip cpi02_both_ff cpi12_both_ff; do
+            assemble_case "$case_name"
+            assemble_status="$(cat "$out_dir/${case_name}.assemble.status" 2>/dev/null || echo 1)"
+            {
+              echo "## ${case_name} assembly"
+              echo
+              echo "- assemble_status: \`${assemble_status}\`"
+              echo "- object target: \`$(cat "$out_dir/${case_name}.object.target-line.txt" 2>/dev/null || echo missing)\`"
+              echo
+              echo "### source"
+              echo
+              echo "\`\`\`asm"
+              sed -n '1,180p' "$out_dir/${case_name}.s"
+              echo "\`\`\`"
+              echo
+              echo "### object relocations"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${case_name}.object.relocs.txt" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### assemble log"
+              echo
+              echo "\`\`\`text"
+              cat "$out_dir/${case_name}.assemble.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            if [ "$assemble_status" -ne 0 ] || [ "$callee_status" -ne 0 ]; then
+              printf '%s\tassemble_failed\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\n' "$case_name" >> "$rows"
+              continue
+            fi
+            for link_variant in ld_new_no_lto ld_classic_no_lto; do
+              if [ "$link_variant" = "ld_classic_no_lto" ]; then
+                bin="$(link_case "$case_name" "$link_variant" yes)"
+              else
+                bin="$(link_case "$case_name" "$link_variant" no)"
+              fi
+              status="$(cat "$out_dir/${case_name}.${link_variant}/status.txt")"
+              record_case "$case_name" "$link_variant" "$bin" "$status"
+            done
+          done
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-minimal-cpi01-equality-shape
+          path: neon-rej-diagnostics/**
