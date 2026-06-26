@@ -88,7 +88,9 @@ jobs:
           target_hash="hda4635a55fb002f6"
           target_offset_hex="0x1514"
           test_filter="mlkem768::tests::pk_validation"
+          workspace_dir="$PWD"
           crate_dir="$PWD/libcrux-ml-kem"
+          target_root="$PWD/target/release"
           out_dir="$PWD/neon-rej-diagnostics/b9fa-manual-relink-${mode}-${variant}"
           mkdir -p "$out_dir"
           summary="$out_dir/summary.md"
@@ -174,7 +176,7 @@ jobs:
 
           find_test_binary() {
             local candidate
-            for candidate in target/release/deps/libcrux_ml_kem-*; do
+            for candidate in "$target_root"/deps/libcrux_ml_kem-*; do
               if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
                 printf '%s\n' "$candidate"
                 return 0
@@ -196,7 +198,7 @@ jobs:
                   libcrux_ml_kem-*) printf '%s\n' "$obj"; return 0 ;;
                 esac
               fi
-            done < <(find target/release -type f -name '*.o' -print | sort)
+            done < <(find "$target_root" -type f -name '*.o' -print | sort)
             [ -n "$first_match" ] && printf '%s\n' "$first_match"
           }
 
@@ -250,7 +252,9 @@ jobs:
           {
             echo "## Build"
             echo
+            echo "- workspace dir: \`${workspace_dir}\`"
             echo "- crate dir: \`${crate_dir}\`"
+            echo "- target root: \`${target_root}\`"
             echo "- RUSTFLAGS: \`${build_rustflags}\`"
             echo "- compiler_builtins: \`${compiler_builtins}\`"
             echo
@@ -286,8 +290,8 @@ jobs:
           } >> "$summary"
 
           if [ "$build_status" -eq 0 ] && [ -n "$selected_bin" ] && [ -n "$selected_obj" ]; then
-            selected_bin_abs="$crate_dir/$selected_bin"
-            selected_obj_abs="$crate_dir/$selected_obj"
+            selected_bin_abs="$selected_bin"
+            selected_obj_abs="$selected_obj"
             object_sha256="$(shasum -a 256 "$selected_obj_abs" | awk '{print $1}')"
 
             target_line object "$selected_obj_abs" "$out_dir/object.target-line.txt"
@@ -338,7 +342,7 @@ jobs:
               -o "$manual_bin"
               "$selected_obj_abs"
               "$compiler_builtins"
-              -L "$crate_dir/target/release/deps"
+              -L "$target_root/deps"
               -L "$rustlib"
               -liconv
               -lSystem
