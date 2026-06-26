@@ -133,7 +133,8 @@ jobs:
 
           selected=""
           while IFS= read -r obj; do
-            if xcrun llvm-nm -nm "${obj}" | grep -q "${PROBE_TARGET_HASH}"; then
+            obj_symbols="$(xcrun llvm-nm -nm "${obj}" 2>> "${out}/selected-object-nm-errors.txt" || true)"
+            if grep -q "${PROBE_TARGET_HASH}" <<< "${obj_symbols}"; then
               echo "${obj}" >> "${out}/object-candidates.txt"
               base="$(basename "${obj}")"
               if [ -z "${selected}" ] || [[ "${base}" == ${PROBE_PREFERRED_OBJECT_PREFIX}* ]]; then
