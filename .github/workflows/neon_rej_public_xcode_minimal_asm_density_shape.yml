@@ -1,0 +1,424 @@
+name: NEON rejection sampler public Xcode minimal asm density shape
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  minimal-asm-density-shape:
+    name: minimal asm density shape
+    runs-on: macos-14
+
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Build and link generated density shapes
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/minimal-asm-density-shape"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# Minimal assembly density-shape probe"
+            echo
+            echo "Developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find clang || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'density\tcase\tlink_variant\tassemble_status\tlink_status\trun_status\tobject_line\tfinal_line\tobject_sha256\tfinal_sha256\ttext_relocs\tcompact_unwind_relocs\teh_frame_relocs\ttext_size\tobject_size\n' > "$rows"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf 'missing_xcode\tall\tNA\tNA\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          emit_caller_asm() {
+            local path="$1"
+            local density="$2"
+            python3 - "$path" "$density" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          density = int(sys.argv[2])
+          before = density // 2
+          after = density - before
+
+          def emit_dummy(out, index):
+              out.write(f"""
+          .p2align 2
+          .globl _dummy_{index}
+          .private_extern _dummy_{index}
+          _dummy_{index}:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          bl _SIMD128Vector_rej_sample
+          adrp x5, L_dummy_const_{index}@PAGE
+          add x5, x5, L_dummy_const_{index}@PAGEOFF
+          ret
+          .cfi_endproc
+          """)
+
+          with open(path, "w") as out:
+              out.write("""
+          .subsections_via_symbols
+          .text
+          .p2align 2
+          .globl _main
+          .private_extern _main
+          _main:
+          mov w0, #0
+          ret
+          """)
+              for i in range(before):
+                  emit_dummy(out, i)
+              out.write("""
+          .p2align 2
+          .globl _case_b9fa
+          _case_b9fa:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          .rept 458
+          nop
+          .endr
+          L_b9fa_back:
+          nop
+          .rept 882
+          nop
+          .endr
+          bl _SIMD128Vector_rej_sample
+          .rept 2
+          nop
+          .endr
+          adrp x5, L_b9fa_const@PAGE
+          add x5, x5, L_b9fa_const@PAGEOFF
+          .rept 3
+          nop
+          .endr
+          b L_b9fa_back
+          ret
+          .cfi_endproc
+
+          .p2align 2
+          .globl _case_0c67
+          _case_0c67:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          .rept 2876
+          nop
+          .endr
+          bl _SIMD128Vector_rej_sample
+          .rept 6
+          nop
+          .endr
+          adrp x5, L_0c67_const2@PAGE
+          add x5, x5, L_0c67_const2@PAGEOFF
+          adrp x5, L_0c67_const1@PAGE
+          add x5, x5, L_0c67_const1@PAGEOFF
+          .rept 8
+          nop
+          .endr
+          mov x28, x3
+          ret
+          .cfi_endproc
+          """)
+              for i in range(before, density):
+                  emit_dummy(out, i)
+              out.write("""
+          .section __TEXT,__const
+          .p2align 3
+          L_b9fa_const:
+          .quad 0x1122334455667788
+          L_0c67_const1:
+          .quad 0x99aabbccddeeff00
+          L_0c67_const2:
+          .quad 0x0123456789abcdef
+          """)
+              for i in range(density):
+                  out.write(f"L_dummy_const_{i}:\n          .quad 0x{i & 0xffffffffffffffff:016x}\n")
+          PY
+          }
+
+          emit_callee_asm() {
+            local path="$1"
+            cat > "$path" <<'ASM'
+          .text
+          .p2align 2
+          .globl _SIMD128Vector_rej_sample
+          _SIMD128Vector_rej_sample:
+          ret
+          ASM
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local symbol="$3"
+            local offset="$4"
+            local out_file="$5"
+            local dis_file="$out_file.disassembly.txt"
+            local nm_file="$out_file.nm.txt"
+            local symbol_addr target_addr
+            nm -nm "$path" > "$nm_file" 2>&1
+            symbol_addr="$(awk -v s="$symbol" '$0 ~ s { print $1; exit }' "$nm_file")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$offset")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --disassemble "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 10)
+                  hi = min(len(lines), i + 11)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          count_relocs() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              index($0, "Relocation information (" s ")") { print $(NF-1); found=1 }
+              END { if (!found) print 0 }
+            ' "$file"
+          }
+
+          section_size() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              $1 == "sectname" && $2 == s { in_section=1; next }
+              in_section && $1 == "size" { print $2; found=1; exit }
+              END { if (!found) print "NA" }
+            ' "$file"
+          }
+
+          link_with_ld() {
+            local density="$1"
+            local obj="$2"
+            local callee_obj="$3"
+            local link_variant="$4"
+            local use_classic="$5"
+            local link_dir="$out_dir/density-${density}/${link_variant}"
+            local bin="$link_dir/minimal_density.${density}.${link_variant}"
+            local map="$link_dir/minimal_density.${density}.${link_variant}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -demangle
+              -dynamic
+              -arch arm64
+              -platform_version macos 14.0.0 14.0
+              -syslibroot "$sdkroot"
+              -o "$bin"
+              "$obj"
+              "$callee_obj"
+              -lSystem
+              -dead_strip
+              -map "$map"
+            )
+            if [ "$use_classic" = "yes" ]; then
+              args+=(-ld_classic)
+            fi
+            {
+              printf 'DEVELOPER_DIR=%q xcrun ld' "$developer_dir"
+              printf ' %q' "${args[@]}"
+              echo
+            } > "$link_dir/ld-command.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun ld "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          record_variant() {
+            local density="$1"
+            local assemble_status="$2"
+            local obj="$3"
+            local link_variant="$4"
+            local bin="$5"
+            local link_status="$6"
+            local density_dir="$out_dir/density-${density}"
+            local meta_dir="$density_dir/object"
+            local link_dir="$density_dir/${link_variant}"
+            local run_status="NA"
+            local final_sha="NA"
+            local object_sha="NA"
+            local object_b9fa="missing"
+            local object_0c67="missing"
+            local final_b9fa="missing"
+            local final_0c67="missing"
+            local text_relocs="NA"
+            local compact_unwind_relocs="NA"
+            local eh_frame_relocs="NA"
+            local text_size="NA"
+            local object_size="NA"
+            if [ "$assemble_status" -eq 0 ]; then
+              object_sha="$(shasum -a 256 "$obj" | awk '{print $1}')"
+              object_size="$(stat -f '%z' "$obj")"
+              text_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__TEXT,__text")"
+              compact_unwind_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__LD,__compact_unwind")"
+              eh_frame_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__TEXT,__eh_frame")"
+              text_size="$(section_size "$meta_dir/otool-load-commands.txt" "__text")"
+              target_line "density-${density}-b9fa-object" "$obj" "_case_b9fa" "0x1514" "$meta_dir/object.b9fa.target-line.txt"
+              target_line "density-${density}-0c67-object" "$obj" "_case_0c67" "0x2d3c" "$meta_dir/object.0c67.target-line.txt"
+              object_b9fa="$(cat "$meta_dir/object.b9fa.target-line.txt")"
+              object_0c67="$(cat "$meta_dir/object.0c67.target-line.txt")"
+            fi
+            if [ "$link_status" -eq 0 ]; then
+              final_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
+              target_line "density-${density}-${link_variant}-b9fa-final" "$bin" "_case_b9fa" "0x1514" "$link_dir/final.b9fa.target-line.txt"
+              target_line "density-${density}-${link_variant}-0c67-final" "$bin" "_case_0c67" "0x2d3c" "$link_dir/final.0c67.target-line.txt"
+              final_b9fa="$(cat "$link_dir/final.b9fa.target-line.txt")"
+              final_0c67="$(cat "$link_dir/final.0c67.target-line.txt")"
+              run_with_timeout 20 "$bin" > "$link_dir/run.log" 2>&1
+              run_status=$?
+            fi
+            {
+              echo "## density ${density} / ${link_variant}"
+              echo
+              echo "- assemble_status: \`${assemble_status}\`"
+              echo "- link_status: \`${link_status}\`"
+              echo "- run_status: \`${run_status}\`"
+              echo "- object_sha256: \`${object_sha}\`"
+              echo "- final_sha256: \`${final_sha}\`"
+              echo "- b9fa object target: \`${object_b9fa}\`"
+              echo "- b9fa final target: \`${final_b9fa}\`"
+              echo "- 0c67 object target: \`${object_0c67}\`"
+              echo "- 0c67 final target: \`${final_0c67}\`"
+              echo "- text_relocs: \`${text_relocs}\`"
+              echo "- compact_unwind_relocs: \`${compact_unwind_relocs}\`"
+              echo "- eh_frame_relocs: \`${eh_frame_relocs}\`"
+              echo "- text_size: \`${text_size}\`"
+              echo "- object_size: \`${object_size}\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/link.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            printf '%s\tb9fa\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$density" "$link_variant" "$assemble_status" "$link_status" "$run_status" \
+              "$object_b9fa" "$final_b9fa" "$object_sha" "$final_sha" \
+              "$text_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" "$text_size" "$object_size" >> "$rows"
+            printf '%s\t0c67\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$density" "$link_variant" "$assemble_status" "$link_status" "$run_status" \
+              "$object_0c67" "$final_0c67" "$object_sha" "$final_sha" \
+              "$text_relocs" "$compact_unwind_relocs" "$eh_frame_relocs" "$text_size" "$object_size" >> "$rows"
+          }
+
+          for density in 0 1024 4096; do
+            density_dir="$out_dir/density-${density}"
+            mkdir -p "$density_dir/object"
+            caller_asm="$density_dir/minimal_density_caller.s"
+            callee_asm="$density_dir/minimal_density_callee.s"
+            obj="$density_dir/minimal_density_caller.o"
+            callee_obj="$density_dir/minimal_density_callee.o"
+            emit_caller_asm "$caller_asm" "$density"
+            emit_callee_asm "$callee_asm"
+            : > "$density_dir/assemble.log"
+            DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$caller_asm" -o "$obj" >> "$density_dir/assemble.log" 2>&1
+            caller_status=$?
+            DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$callee_asm" -o "$callee_obj" >> "$density_dir/assemble.log" 2>&1
+            callee_status=$?
+            assemble_status=0
+            if [ "$caller_status" -ne 0 ] || [ "$callee_status" -ne 0 ]; then
+              assemble_status=1
+            fi
+            if [ "$assemble_status" -eq 0 ]; then
+              otool -l "$obj" > "$density_dir/object/otool-load-commands.txt" 2>&1 || true
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --reloc "$obj" > "$density_dir/object/objdump-relocs.txt" 2>&1 || true
+            fi
+            for link_variant in ld_new_no_lto ld_classic_no_lto; do
+              use_classic=no
+              if [ "$link_variant" = "ld_classic_no_lto" ]; then
+                use_classic=yes
+              fi
+              if [ "$assemble_status" -eq 0 ]; then
+                bin="$(link_with_ld "$density" "$obj" "$callee_obj" "$link_variant" "$use_classic")"
+                link_status="$(cat "$density_dir/${link_variant}/status.txt")"
+              else
+                bin=""
+                link_status="NA"
+              fi
+              record_variant "$density" "$assemble_status" "$obj" "$link_variant" "$bin" "$link_status"
+            done
+          done
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-minimal-asm-density-shape
+          path: neon-rej-diagnostics/**
