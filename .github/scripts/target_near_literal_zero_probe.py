@@ -509,10 +509,28 @@ def find_target_object(target_root, target_hash, preferred_prefix, out_dir, comp
     return candidates[0] if candidates else None
 
 
-def link_object(object_path, variant, classic, cfg, out_dir):
-    link_dir = out_dir / variant / ("ld_classic_no_lto" if classic else "ld_new_no_lto")
+def parse_extra_link_variants(spec):
+    variants = []
+    for item in spec.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            label, args = item.split(":", 1)
+            link_args = [a for a in args.split(",") if a]
+        else:
+            label = item
+            link_args = []
+        if not re.match(r"^[A-Za-z0-9_.-]+$", label):
+            raise ValueError(f"unsafe link variant label: {label!r}")
+        variants.append((label, link_args))
+    return variants
+
+
+def link_object(object_path, variant, link_label, link_args, cfg, out_dir):
+    link_dir = out_dir / variant / link_label
     link_dir.mkdir(parents=True, exist_ok=True)
-    bin_path = link_dir / f"test.{variant}.{'classic' if classic else 'new'}"
+    bin_path = link_dir / f"test.{variant}.{link_label}"
     map_path = link_dir / f"{bin_path.name}.map"
     args = [
         "xcrun", "ld",
@@ -535,8 +553,7 @@ def link_object(object_path, variant, classic, cfg, out_dir):
     ]
     if not cfg["compact_artifacts"]:
         args += ["-map", str(map_path)]
-    if classic:
-        args.append("-ld_classic")
+    args += link_args
     (link_dir / "ld-command.txt").write_text("DEVELOPER_DIR={} {}\n".format(cfg["developer_dir"], " ".join(args)))
     env = os.environ.copy()
     env["DEVELOPER_DIR"] = cfg["developer_dir"]
@@ -560,6 +577,7 @@ def main():
         "cpi_prefix": os.environ.get("PROBE_CPI_PREFIX", ""),
         "cpi_subset_mode": os.environ.get("PROBE_CPI_SUBSET_MODE", "range"),
         "compact_artifacts": os.environ.get("PROBE_COMPACT_ARTIFACTS", "") == "1",
+        "extra_link_variants": os.environ.get("PROBE_EXTRA_LD_VARIANTS", ""),
         "developer_dir": "/Applications/Xcode_15.0.1.app/Contents/Developer",
         "target_root": str(Path.cwd() / "target" / "release"),
     }
@@ -611,6 +629,12 @@ def main():
     print(f"selected object={selected}", flush=True)
     if selected is None:
         raise SystemExit(0)
+
+    link_variants = [
+        ("ld_new_no_lto", []),
+        ("ld_classic_no_lto", ["-ld_classic"]),
+    ] + parse_extra_link_variants(cfg["extra_link_variants"])
+    append(summary, "- link variants: `" + "`, `".join(label for label, _args in link_variants) + "`\n\n")
 
     variants = [("original", selected, 0, "copied original")]
     obj_dir = out_dir / "objects"
@@ -666,10 +690,9 @@ def main():
         variant_expected = str(count_bytes(obj_path, cfg["expected_bytes"]))
         obj_hash = sha256(selected)
         variant_hash = sha256(obj_path)
-        for classic in (False, True):
-            link_variant = "ld_classic_no_lto" if classic else "ld_new_no_lto"
+        for link_variant, link_args in link_variants:
             print(f"linking {link_variant}", flush=True)
-            bin_path, link_status, _link_dir = link_object(obj_path, variant, classic, cfg, out_dir)
+            bin_path, link_status, _link_dir = link_object(obj_path, variant, link_variant, link_args, cfg, out_dir)
             final_line = "missing"
             final_expected = "NA"
             final_corrupt = "NA"

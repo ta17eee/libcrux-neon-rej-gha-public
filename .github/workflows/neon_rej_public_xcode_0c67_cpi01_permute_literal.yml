@@ -102,6 +102,7 @@ jobs:
           PROBE_NEAR_LITERALS: ${{ matrix.probe.near_literals }}
           PROBE_CPI_PREFIX: ${{ matrix.probe.cpi_prefix }}
           PROBE_CPI_SUBSET_MODE: cpi01_permute
+          PROBE_EXTRA_LD_VARIANTS: "ld_new_no_deduplicate:-no_deduplicate"
           PROBE_COMPACT_ARTIFACTS: "1"
         run: |
           python3 ../probe-repo/.github/scripts/target_near_literal_zero_probe.py
