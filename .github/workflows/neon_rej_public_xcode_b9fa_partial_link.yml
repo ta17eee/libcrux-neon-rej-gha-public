@@ -1,0 +1,422 @@
+name: NEON rejection sampler public Xcode b9fa partial link
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  partial-link:
+    name: b9fa partial link ${{ matrix.mode.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: b9fa21c6d53dc2b7de2e50d1694af284cb55f769
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build saved object and probe partial links
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode.label }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          target_hash="hda4635a55fb002f6"
+          target_offset_hex="0x1514"
+          test_filter="mlkem768::tests::pk_validation"
+          crate_dir="$PWD/libcrux-ml-kem"
+          target_root="$PWD/target/release"
+          out_dir="$PWD/neon-rej-diagnostics/b9fa-partial-link-${mode}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# b9fa partial-link probe"
+            echo
+            echo "Commit: \`b9fa21c6d53dc2b7de2e50d1694af284cb55f769\`"
+            echo "Mode: \`${mode}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'mode\tvariant\tpartial_status\tfinal_status\trun_status\tobject_line\tpartial_line\tfinal_line\tpartial_sha256\tfinal_sha256\n' > "$rows"
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in "$target_root"/deps/libcrux_ml_kem-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  libcrux_ml_kem-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find "$target_root" -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local out_file="$3"
+            local symbol_addr target_addr dis_file
+            dis_file="$out_dir/${kind}.disassembly.txt"
+            nm -nm "$path" > "$out_dir/${kind}.nm.txt" 2>&1
+            symbol_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/${kind}.nm.txt")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 10)
+                  hi = min(len(lines), i + 11)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf '%s\tmissing_xcode\tNA\tNA\tNA\tmissing\tmissing\tmissing\tNA\tNA\n' "$mode" >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          rustlib="$(rustc +1.78.0 --print target-libdir)"
+          compiler_builtins="$(ls "$rustlib"/libcompiler_builtins-*.rlib | head -n 1)"
+          build_rustflags="-C save-temps ${target_feature_flags}"
+          DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml \
+              --verbose --release --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          selected_bin="$(find_test_binary || true)"
+          selected_obj="$(find_target_object || true)"
+          object_line="missing"
+          object_sha256="NA"
+          if [ "$build_status" -eq 0 ] && [ -n "$selected_obj" ]; then
+            object_sha256="$(shasum -a 256 "$selected_obj" | awk '{print $1}')"
+            target_line object "$selected_obj" "$out_dir/object.target-line.txt"
+            object_line="$(cat "$out_dir/object.target-line.txt")"
+          fi
+
+          {
+            echo "## Build"
+            echo
+            echo "- RUSTFLAGS: \`${build_rustflags}\`"
+            echo "- build_status: \`${build_status}\`"
+            echo "- selected_bin: \`${selected_bin:-missing}\`"
+            echo "- selected_obj: \`${selected_obj:-missing}\`"
+            echo "- object_sha256: \`${object_sha256}\`"
+            echo "- object target: \`${object_line}\`"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object.target-line.txt.window" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+            echo "## Build log tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 120 "$out_dir/build.log" || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -ne 0 ] || [ -z "$selected_obj" ] || [ -z "$compiler_builtins" ]; then
+            printf '%s\tbuild_or_lookup_failed\tNA\tNA\tNA\t%s\tmissing\tmissing\tNA\tNA\n' "$mode" "$object_line" >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          final_link() {
+            local label="$1"
+            local input_obj="$2"
+            local final_extra="$3"
+            local link_dir="$out_dir/${label}"
+            local bin="$link_dir/libcrux_ml_kem.${label}"
+            local map="$link_dir/libcrux_ml_kem.${label}.map"
+            local dash="$link_dir/cc-dash.log"
+            local log="$link_dir/link.log"
+            local run_log="$link_dir/run.log"
+            local line_file="$link_dir/final.target-line.txt"
+            local status run_status line sha
+            mkdir -p "$link_dir"
+            local args=(
+              -arch arm64
+              -nodefaultlibs
+              -o "$bin"
+              "$input_obj"
+              "$compiler_builtins"
+              -L "$target_root/deps"
+              -L "$rustlib"
+              -liconv
+              -lSystem
+              -lc
+              -lm
+              -Wl,-dead_strip
+              -Wl,-map,"$map"
+            )
+            if [ -n "$final_extra" ]; then
+              read -r -a parsed_final_extra <<< "$final_extra"
+              args+=("${parsed_final_extra[@]}")
+            fi
+            DEVELOPER_DIR="${developer_dir}" xcrun cc -### "${args[@]}" > "$dash" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun cc "${args[@]}" > "$log" 2>&1
+            status=$?
+            run_status="NA"
+            line="missing"
+            sha="NA"
+            if [ "$status" -eq 0 ]; then
+              sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
+              target_line "$label-final" "$bin" "$line_file"
+              line="$(cat "$line_file")"
+              ( cd "$crate_dir" && run_with_timeout 90 "$bin" "$test_filter" --exact --nocapture ) > "$run_log" 2>&1
+              run_status=$?
+            fi
+            printf '%s|%s|%s|%s\n' "$status" "$run_status" "$line" "$sha" > "$link_dir/result.txt"
+          }
+
+          probe_partial() {
+            local label="$1"
+            local partial_extra="$2"
+            local final_extra="$3"
+            local link_dir="$out_dir/${label}"
+            local partial="$link_dir/partial.${label}.o"
+            local partial_dash="$link_dir/partial-cc-dash.log"
+            local partial_log="$link_dir/partial-link.log"
+            local partial_line_file="$link_dir/partial.target-line.txt"
+            local partial_status partial_line partial_sha final_status run_status final_line final_sha
+            mkdir -p "$link_dir"
+
+            {
+              echo "## Variant: ${label}"
+              echo
+              echo "- partial extra flags: \`${partial_extra:-none}\`"
+              echo "- final extra flags: \`${final_extra:-none}\`"
+              echo
+            } >> "$summary"
+
+            local partial_args=(-arch arm64 -r -o "$partial" "$selected_obj")
+            if [ -n "$partial_extra" ]; then
+              read -r -a parsed_partial_extra <<< "$partial_extra"
+              partial_args+=("${parsed_partial_extra[@]}")
+            fi
+            DEVELOPER_DIR="${developer_dir}" xcrun cc -### "${partial_args[@]}" > "$partial_dash" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun cc "${partial_args[@]}" > "$partial_log" 2>&1
+            partial_status=$?
+            partial_line="missing"
+            partial_sha="NA"
+            final_status="NA"
+            run_status="NA"
+            final_line="missing"
+            final_sha="NA"
+
+            if [ "$partial_status" -eq 0 ]; then
+              partial_sha="$(shasum -a 256 "$partial" | awk '{print $1}')"
+              target_line "$label-partial" "$partial" "$partial_line_file"
+              partial_line="$(cat "$partial_line_file")"
+              final_link "$label" "$partial" "$final_extra"
+              IFS='|' read -r final_status run_status final_line final_sha < "$link_dir/result.txt"
+            fi
+
+            {
+              echo "- partial_status: \`${partial_status}\`"
+              echo "- final_status: \`${final_status}\`"
+              echo "- run_status: \`${run_status}\`"
+              echo "- partial_sha256: \`${partial_sha}\`"
+              echo "- partial target: \`${partial_line}\`"
+              echo "- final_sha256: \`${final_sha}\`"
+              echo "- final target: \`${final_line}\`"
+              echo
+              echo "### partial target window"
+              echo
+              echo "\`\`\`text"
+              cat "$partial_line_file.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### final target window"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/final.target-line.txt.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### partial link log"
+              echo
+              echo "\`\`\`text"
+              cat "$partial_log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### final run log tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$link_dir/run.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$mode" "$label" "$partial_status" "$final_status" "$run_status" \
+              "$object_line" "$partial_line" "$final_line" "$partial_sha" "$final_sha" \
+              >> "$rows"
+          }
+
+          direct_dir="$out_dir/direct-new-final"
+          mkdir -p "$direct_dir"
+          final_link "direct-new-final" "$selected_obj" ""
+          IFS='|' read -r direct_final_status direct_run_status direct_final_line direct_final_sha < "$direct_dir/result.txt"
+          {
+            echo "## Variant: direct-new-final"
+            echo
+            echo "- final_status: \`${direct_final_status}\`"
+            echo "- run_status: \`${direct_run_status}\`"
+            echo "- final_sha256: \`${direct_final_sha}\`"
+            echo "- final target: \`${direct_final_line}\`"
+            echo
+            echo "\`\`\`text"
+            cat "$direct_dir/final.target-line.txt.window" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+          printf '%s\tdirect-new-final\tNA\t%s\t%s\t%s\tNA\t%s\tNA\t%s\n' \
+            "$mode" "$direct_final_status" "$direct_run_status" "$object_line" "$direct_final_line" "$direct_final_sha" \
+            >> "$rows"
+
+          probe_partial "partial-new-final-new" "" ""
+          probe_partial "partial-classic-final-new" "-Wl,-ld_classic" ""
+          probe_partial "partial-new-final-classic" "" "-Wl,-ld_classic"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-b9fa-partial-link-${{ matrix.mode.label }}
+          path: neon-rej-diagnostics/**
