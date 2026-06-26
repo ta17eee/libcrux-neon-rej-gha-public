@@ -313,6 +313,7 @@ jobs:
               -lSystem
               -lc
               -u "_case_${case_name}"
+              -u "_target_${case_name}"
               -u "_keep_all_${case_name}"
               -dead_strip
               -map "$map"
