@@ -1,0 +1,407 @@
+name: NEON rejection sampler public Xcode 0c67 manual option sweep
+
+"on":
+  workflow_dispatch:
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  manual-option-sweep:
+    name: 0c67 manual option sweep ${{ matrix.mode.label }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - label: ordinary
+            target_feature_flags: ""
+          - label: plus-neon
+            target_feature_flags: "-C target_feature=+neon"
+
+    steps:
+      - name: Checkout public upstream libcrux
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 0c67a85b028f74bac401f6adf14581b2e05104e1
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        id: patch_deps
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Install historical toolchain
+        id: install_toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build saved object once and sweep manual linker options
+        if: ${{ always() && steps.patch_deps.outcome == 'success' && steps.install_toolchain.outcome == 'success' }}
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          mode="${{ matrix.mode.label }}"
+          target_feature_flags="${{ matrix.mode.target_feature_flags }}"
+          target_hash="h8997d6f42564fb09"
+          target_offset_hex="0x2d3c"
+          test_filter="kyber1024_nist_known_answer_tests"
+          crate_dir="$PWD/libcrux-ml-kem"
+          target_root="$PWD/target/release"
+          out_dir="$PWD/neon-rej-diagnostics/0c67-manual-option-sweep-${mode}"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          row_file="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# 0c67 manual linker-option sweep"
+            echo
+            echo "Commit: \`0c67a85b028f74bac401f6adf14581b2e05104e1\`"
+            echo "Mode: \`${mode}\`"
+            echo "Developer dir: \`${developer_dir}\`"
+            echo "Target feature flags: \`${target_feature_flags}\`"
+            echo "Target: \`generate_keypair17${target_hash} + ${target_offset_hex}\`"
+            echo "Focused test: \`${test_filter}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            sysctl hw.optional.arm.AdvSIMD || true
+            if [ -d "${developer_dir}" ]; then
+              DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find cc || true
+              DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+              DEVELOPER_DIR="${developer_dir}" ld -v || true
+              DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            else
+              echo "selected developer dir absent"
+            fi
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'mode\tlink_variant\tmanual_link_status\tmanual_run_status\tobject_line\tmanual_final_line\tobject_sha256\tmanual_sha256\tmanual_extra_flags\n' > "$row_file"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf '%s\tmissing_xcode\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' "$mode" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          add_hex() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          print(f"{int(sys.argv[1], 16) + int(sys.argv[2], 16):x}")
+          PY
+          }
+
+          run_with_timeout() {
+            local seconds="$1"
+            shift
+            python3 - "$seconds" "$@" <<'PY'
+          import os, signal, subprocess, sys, time
+          seconds = int(sys.argv[1])
+          argv = sys.argv[2:]
+          proc = subprocess.Popen(argv, preexec_fn=os.setsid)
+          deadline = time.time() + seconds
+          while True:
+              status = proc.poll()
+              if status is not None:
+                  raise SystemExit(status)
+              if time.time() >= deadline:
+                  print(f"timeout after {seconds}s; terminating pid {proc.pid}", flush=True)
+                  os.killpg(proc.pid, signal.SIGTERM)
+                  time.sleep(5)
+                  if proc.poll() is None:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  raise SystemExit(124)
+              time.sleep(1)
+          PY
+          }
+
+          find_test_binary() {
+            local candidate
+            for candidate in "$target_root"/deps/nistkats-*; do
+              if [ -f "$candidate" ] && file "$candidate" | grep -q 'Mach-O.*executable'; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_target_object() {
+            local obj nm_file first_match=""
+            : > "$out_dir/object-candidates.txt"
+            while IFS= read -r obj; do
+              nm_file="$out_dir/$(basename "$obj").nm.txt"
+              nm -nm "$obj" > "$nm_file" 2>&1
+              if grep -q "$target_hash" "$nm_file"; then
+                printf '%s\n' "$obj" >> "$out_dir/object-candidates.txt"
+                [ -z "$first_match" ] && first_match="$obj"
+                case "$(basename "$obj")" in
+                  nistkats-*) printf '%s\n' "$obj"; return 0 ;;
+                esac
+              fi
+            done < <(find "$target_root" -type f -name '*.o' -print | sort)
+            [ -n "$first_match" ] && printf '%s\n' "$first_match"
+          }
+
+          target_line() {
+            local kind="$1"
+            local path="$2"
+            local out_file="$3"
+            local symbol_addr target_addr dis_file
+            dis_file="$out_dir/${kind}.disassembly.txt"
+            nm -nm "$path" > "$out_dir/${kind}.nm.txt" 2>&1
+            symbol_addr="$(awk -v h="$target_hash" '$0 ~ h { print $1; exit }' "$out_dir/${kind}.nm.txt")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            target_addr="$(add_hex "0x${symbol_addr}" "$target_offset_hex")"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --demangle --disassemble \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$target_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          lines = open(path, errors="replace").read().splitlines()
+          found = "missing"
+          for i, line in enumerate(lines):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  lo = max(0, i - 12)
+                  hi = min(len(lines), i + 13)
+                  with open(out + ".window", "w") as f:
+                      for w in lines[lo:hi]:
+                          f.write(w + "\n")
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          rustlib="$(rustc +1.78.0 --print target-libdir)"
+          compiler_builtins="$(ls "$rustlib"/libcompiler_builtins-*.rlib | head -n 1)"
+          if [ -z "$compiler_builtins" ]; then
+            echo "missing compiler_builtins" >> "$summary"
+            printf '%s\tmissing_compiler_builtins\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' "$mode" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          build_rustflags="-C save-temps ${target_feature_flags}"
+          {
+            echo "## Build"
+            echo
+            echo "- crate dir: \`${crate_dir}\`"
+            echo "- target root: \`${target_root}\`"
+            echo "- RUSTFLAGS: \`${build_rustflags}\`"
+            echo "- compiler_builtins: \`${compiler_builtins}\`"
+            echo
+          } >> "$summary"
+
+          DEVELOPER_DIR="${developer_dir}" RUSTFLAGS="${build_rustflags}" \
+            cargo +1.78.0 test --manifest-path libcrux-ml-kem/Cargo.toml \
+              --verbose --release --test nistkats --no-run \
+            > "$out_dir/build.log" 2>&1
+          build_status=$?
+
+          selected_bin="$(find_test_binary || true)"
+          selected_obj="$(find_target_object || true)"
+
+          {
+            echo "- build_status: \`${build_status}\`"
+            echo "- selected_bin: \`${selected_bin:-missing}\`"
+            echo "- selected_obj: \`${selected_obj:-missing}\`"
+            echo
+            echo "## Build log tail"
+            echo
+            echo "\`\`\`text"
+            tail -n 120 "$out_dir/build.log" || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          if [ "$build_status" -ne 0 ] || [ -z "$selected_bin" ] || [ -z "$selected_obj" ]; then
+            printf '%s\tbuild_or_lookup_failed\t%s\tNA\tmissing\tmissing\tNA\tNA\tNA\n' "$mode" "$build_status" >> "$row_file"
+            cat "$summary"
+            exit 0
+          fi
+
+          object_sha256="$(shasum -a 256 "$selected_obj" | awk '{print $1}')"
+          target_line object "$selected_obj" "$out_dir/object.target-line.txt"
+          object_line="$(cat "$out_dir/object.target-line.txt")"
+
+          {
+            echo "## Selected object"
+            echo
+            echo "- object sha256: \`${object_sha256}\`"
+            echo "- object target: \`${object_line}\`"
+            echo
+            echo "\`\`\`text"
+            cat "$out_dir/object.target-line.txt.window" 2>/dev/null || true
+            echo "\`\`\`"
+            echo
+          } >> "$summary"
+
+          cat > "$out_dir/manual-variants.txt" <<'EOF'
+          default_dead_strip|yes|
+          no_dead_strip|no|
+          ld_new|yes|-Wl,-ld_new
+          ld_O0|yes|-Wl,-O0
+          no_compact_unwind|yes|-Wl,-no_compact_unwind
+          no_branch_islands|yes|-Wl,-no_branch_islands
+          no_function_starts|yes|-Wl,-no_function_starts
+          no_data_in_code_info|yes|-Wl,-no_data_in_code_info
+          no_fixup_chains|yes|-Wl,-no_fixup_chains
+          no_adhoc_codesign|yes|-Wl,-no_adhoc_codesign
+          no_pie|yes|-Wl,-no_pie
+          ld_classic_dead_strip|yes|-Wl,-ld_classic
+          ld_classic_no_dead_strip|no|-Wl,-ld_classic
+          EOF
+
+          while IFS='|' read -r link_label use_dead_strip extra_flags; do
+            [ -n "$link_label" ] || continue
+            link_dir="$out_dir/link-${link_label}"
+            mkdir -p "$link_dir"
+            manual_bin="$link_dir/nistkats.manual-${link_label}"
+            manual_map="$link_dir/nistkats.manual-${link_label}.map"
+            manual_dash="$link_dir/cc-dash.log"
+            manual_link_log="$link_dir/link.log"
+            manual_run_log="$link_dir/run.log"
+            manual_target_line_file="$link_dir/manual.target-line.txt"
+            manual_link_status="NA"
+            manual_run_status="NA"
+            manual_final_line="missing"
+            manual_sha256="NA"
+
+            manual_args=(
+              -arch arm64
+              -nodefaultlibs
+              -o "$manual_bin"
+              "$selected_obj"
+              "$compiler_builtins"
+              -L "$target_root/deps"
+              -L "$rustlib"
+              -liconv
+              -lSystem
+              -lc
+              -lm
+              -Wl,-map,"$manual_map"
+            )
+            if [ "$use_dead_strip" = "yes" ]; then
+              manual_args+=(-Wl,-dead_strip)
+            fi
+            if [ -n "$extra_flags" ]; then
+              read -r -a parsed_extra_flags <<< "$extra_flags"
+              manual_args+=("${parsed_extra_flags[@]}")
+            fi
+
+            {
+              echo "## Manual relink variant: ${link_label}"
+              echo
+              echo "- use_dead_strip: \`${use_dead_strip}\`"
+              echo "- extra flags: \`${extra_flags:-none}\`"
+              echo
+              echo "### command"
+              echo
+              echo "\`\`\`text"
+              printf 'DEVELOPER_DIR=%q xcrun cc' "$developer_dir"
+              printf ' %q' "${manual_args[@]}"
+              echo
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            DEVELOPER_DIR="${developer_dir}" xcrun cc -### "${manual_args[@]}" \
+              > "$manual_dash" 2>&1 || true
+            DEVELOPER_DIR="${developer_dir}" xcrun cc "${manual_args[@]}" \
+              > "$manual_link_log" 2>&1
+            manual_link_status=$?
+
+            if [ "$manual_link_status" -eq 0 ]; then
+              manual_sha256="$(shasum -a 256 "$manual_bin" | awk '{print $1}')"
+              target_line "manual-${link_label}" "$manual_bin" "$manual_target_line_file"
+              manual_final_line="$(cat "$manual_target_line_file")"
+              ( cd "$crate_dir" && run_with_timeout 90 "$manual_bin" "$test_filter" --exact --nocapture ) \
+                > "$manual_run_log" 2>&1
+              manual_run_status=$?
+            fi
+
+            {
+              echo "### result"
+              echo
+              echo "- manual_link_status: \`${manual_link_status}\`"
+              echo "- manual_run_status: \`${manual_run_status}\`"
+              echo "- manual_sha256: \`${manual_sha256}\`"
+              echo "- manual final: \`${manual_final_line}\`"
+              echo
+              echo "### target window"
+              echo
+              echo "\`\`\`text"
+              cat "$manual_target_line_file.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$manual_link_log" || true
+              echo "\`\`\`"
+              echo
+              echo "### run log tail"
+              echo
+              echo "\`\`\`text"
+              tail -n 80 "$manual_run_log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$mode" "$link_label" "$manual_link_status" "$manual_run_status" \
+              "$object_line" "$manual_final_line" "$object_sha256" "$manual_sha256" "${extra_flags:-none}" \
+              >> "$row_file"
+          done < "$out_dir/manual-variants.txt"
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-0c67-manual-option-sweep-${{ matrix.mode.label }}
+          path: neon-rej-diagnostics/**
