@@ -165,6 +165,90 @@ def zero_symbol_ranges(src, dst, ranges, log_path):
     return 0
 
 
+def symbol_ranges(src, symbols, size, log_path):
+    data = bytearray(Path(src).read_bytes())
+    sections = macho_sections(data)
+    wanted = set(symbols)
+    nm_out = output(["xcrun", "llvm-nm", "-nm", str(src)])
+    nm_re = re.compile(r"^([0-9a-fA-F]+) \(([^,]+),([^)]+)\) .* ([^ ]+)$")
+    found = {}
+    for line in nm_out.splitlines():
+        match = nm_re.match(line.strip())
+        if not match:
+            continue
+        name = match.group(4)
+        if name in wanted:
+            found[name] = (int(match.group(1), 16), match.group(2), match.group(3))
+    missing = sorted(wanted - set(found))
+    lines = []
+    if missing:
+        lines.append("missing symbols: " + " ".join(missing))
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return None, data, 44
+    ranges = {}
+    for name in symbols:
+        value, sym_seg, sym_sect = found[name]
+        candidates = [s for s in sections if s[0] == sym_seg and s[1] == sym_sect and s[2] <= value < s[2] + s[3]]
+        if not candidates:
+            lines.append(f"{name}: no containing section for value=0x{value:x} {sym_seg},{sym_sect}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return None, data, 2
+        seg, sect, addr, sect_size, file_offset = candidates[0]
+        rel = value - addr
+        start = file_offset + rel
+        end = start + size
+        if rel + size > sect_size or end > len(data):
+            lines.append(f"{name}: range out of section/file value=0x{value:x} rel={rel} size={size}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return None, data, 2
+        ranges[name] = (start, end, value, seg, sect)
+        lines.append(f"{name}: {seg},{sect} value=0x{value:x} file_offset={start} size={size} old={bytes(data[start:end]).hex()}")
+    Path(log_path).write_text("\n".join(lines) + "\n")
+    return ranges, data, 0
+
+
+def transform_cpi01_pair(src, dst, s0, s1, mode, log_path):
+    ranges, data, status = symbol_ranges(src, [s0, s1], 16, log_path)
+    if status != 0:
+        return status
+    a0, b0, *_ = ranges[s0]
+    a1, b1, *_ = ranges[s1]
+    v0 = bytes(data[a0:b0])
+    v1 = bytes(data[a1:b1])
+    pair = v0 + v1
+    if mode == "zero_full":
+        new0 = b"\0" * 16
+        new1 = b"\0" * 16
+    elif mode == "swap_entries":
+        new0, new1 = v1, v0
+    elif mode == "reverse_pair":
+        rev = pair[::-1]
+        new0, new1 = rev[:16], rev[16:]
+    elif mode == "reverse_each_entry":
+        new0, new1 = v0[::-1], v1[::-1]
+    elif mode == "swap_first_word":
+        new0 = v1[:4] + v0[4:]
+        new1 = v0[:4] + v1[4:]
+    elif mode == "swap_last_word":
+        new0 = v0[:12] + v1[12:]
+        new1 = v1[:12] + v0[12:]
+    elif mode == "duplicate_0":
+        new0, new1 = v0, v0
+    elif mode == "duplicate_1":
+        new0, new1 = v1, v1
+    else:
+        Path(log_path).write_text(f"unknown transform mode: {mode}\n")
+        return 2
+    data[a0:b0] = new0
+    data[a1:b1] = new1
+    with open(log_path, "a") as f:
+        f.write(f"mode={mode}\n")
+        f.write(f"{s0}: new={new0.hex()}\n")
+        f.write(f"{s1}: new={new1.hex()}\n")
+    Path(dst).write_bytes(data)
+    return 0
+
+
 def zero_section(src, dst, section_name, log_path):
     target_seg, target_sect = section_name.split(",", 1)
     data = bytearray(Path(src).read_bytes())
@@ -206,7 +290,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -324,6 +408,24 @@ def cpi_range_subsets(prefix, symbols, mode):
                 [(s0, a_idx * 4, 4), (s1, b_idx * 4, 4)],
             ))
     return out
+
+
+def cpi_pair_transforms(prefix, symbols, mode):
+    if mode != "cpi01_permute" or len(symbols) < 2:
+        return []
+    s0 = symbols[0]
+    s1 = symbols[1]
+    modes = [
+        "zero_full",
+        "swap_entries",
+        "reverse_pair",
+        "reverse_each_entry",
+        "swap_first_word",
+        "swap_last_word",
+        "duplicate_0",
+        "duplicate_1",
+    ]
+    return [(f"{prefix}cpi01_{m}", s0, s1, m) for m in modes]
 
 
 def add_hex(a, b):
@@ -517,6 +619,11 @@ def main():
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = zero_symbol_ranges(selected, dst, ranges, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, s0, s1, mode in cpi_pair_transforms(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = transform_cpi01_pair(selected, dst, s0, s1, mode, log)
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     print(f"prepared variants={len(variants)} mode={cfg['cpi_subset_mode']}", flush=True)
