@@ -81,6 +81,76 @@ def macho_sections(data):
     return sections
 
 
+def macho_symtab(data):
+    if len(data) < 32:
+        raise ValueError("file too small for mach_header_64")
+    magic, = struct.unpack_from("<I", data, 0)
+    if magic != 0xfeedfacf:
+        raise ValueError(f"unexpected Mach-O magic 0x{magic:08x}")
+    ncmds, = struct.unpack_from("<I", data, 16)
+    off = 32
+    for _ in range(ncmds):
+        if off + 8 > len(data):
+            raise ValueError("truncated load command")
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == 0x2:  # LC_SYMTAB
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, off + 8)
+            return symoff, nsyms, stroff, strsize
+        off += cmdsize
+    raise ValueError("missing LC_SYMTAB")
+
+
+def same_len_name(name, marker):
+    if len(marker) > len(name):
+        raise ValueError(f"marker too long for {name}: {marker}")
+    return marker + name[len(marker):]
+
+
+def rename_symbols_same_length(src, dst, mapping, log_path):
+    data = bytearray(Path(src).read_bytes())
+    symoff, nsyms, stroff, strsize = macho_symtab(data)
+    found = {}
+    lines = []
+    for i in range(nsyms):
+        entry_off = symoff + i * 16
+        if entry_off + 16 > len(data):
+            Path(log_path).write_text(f"truncated nlist at index {i}\n")
+            return 2
+        n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, entry_off)
+        if n_strx == 0:
+            continue
+        name_off = stroff + n_strx
+        if name_off < stroff or name_off >= stroff + strsize or name_off >= len(data):
+            continue
+        end = data.find(b"\0", name_off, min(stroff + strsize, len(data)))
+        if end < 0:
+            continue
+        name = data[name_off:end].decode("ascii", "replace")
+        if name not in mapping:
+            continue
+        new_name = mapping[name]
+        old = data[name_off:end]
+        new = new_name.encode("ascii")
+        if len(new) != len(old):
+            lines.append(f"{name}: refusing non-same-length rename to {new_name}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        data[name_off:end] = new
+        found[name] = (new_name, i, n_type, n_sect, n_desc, n_value)
+        lines.append(
+            f"renamed {name} -> {new_name} sym_index={i} type=0x{n_type:02x} "
+            f"sect={n_sect} desc=0x{n_desc:04x} value=0x{n_value:x}"
+        )
+    missing = sorted(set(mapping) - set(found))
+    if missing:
+        lines.append("missing symbols: " + " ".join(missing))
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 44
+    Path(dst).write_bytes(data)
+    Path(log_path).write_text("\n".join(lines) + "\n")
+    return 0
+
+
 def zero_symbols(src, dst, symbols, size, log_path):
     data = bytearray(Path(src).read_bytes())
     sections = macho_sections(data)
@@ -310,7 +380,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -473,6 +543,23 @@ def cpi_pair_transforms(prefix, symbols, mode):
         for pair_label, left, right in pairs
         for m in modes
     ]
+
+
+def cpi_symbol_name_transforms(prefix, symbols, mode):
+    if mode != "cpi01_symbol_names" or len(symbols) < 3:
+        return []
+    s0, s1, s2 = symbols[0], symbols[1], symbols[2]
+    transforms = [
+        ("cpi0_rename", {s0: same_len_name(s0, "m")}),
+        ("cpi1_rename", {s1: same_len_name(s1, "m")}),
+        ("cpi2_rename", {s2: same_len_name(s2, "m")}),
+        ("cpi01_rename_distinct", {s0: same_len_name(s0, "m"), s1: same_len_name(s1, "n")}),
+        ("cpi01_swap_names", {s0: s1, s1: s0}),
+        ("cpi01_equal_name0", {s1: s0}),
+        ("cpi01_equal_name1", {s0: s1}),
+        ("cpi12_equal_name1", {s2: s1}),
+    ]
+    return [(f"{prefix}{label}", mapping) for label, mapping in transforms]
 
 
 def add_hex(a, b):
@@ -720,6 +807,11 @@ def main():
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = transform_cpi01_pair(selected, dst, s0, s1, mode, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, mapping in cpi_symbol_name_transforms(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = rename_symbols_same_length(selected, dst, mapping, log)
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     print(f"prepared variants={len(variants)} mode={cfg['cpi_subset_mode']}", flush=True)
