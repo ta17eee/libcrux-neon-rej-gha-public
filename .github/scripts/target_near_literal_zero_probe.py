@@ -206,7 +206,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -268,13 +268,19 @@ def cpi_subsets(prefix, symbols, mode):
 
 
 def cpi_range_subsets(prefix, symbols, mode):
-    if mode not in ("cpi01_words", "cpi01_asym", "cpi01_omit") or len(symbols) < 2:
+    if mode not in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit") or len(symbols) < 2:
         return []
     s0 = symbols[0]
     s1 = symbols[1]
     out = [(f"zero_{prefix}cpi01_full", [(s0, 0, 16), (s1, 0, 16)])]
     pair_words = [(s0, 0, 4), (s0, 4, 4), (s0, 8, 4), (s0, 12, 4), (s1, 0, 4), (s1, 4, 4), (s1, 8, 4), (s1, 12, 4)]
     pair_halves = [(s0, 0, 8), (s0, 8, 8), (s1, 0, 8), (s1, 8, 8)]
+    pair_bytes = [(s0, i, 1) for i in range(16)] + [(s1, i, 1) for i in range(16)]
+    if mode == "cpi01_byte_omit":
+        for idx, (name, offset, _size) in enumerate(pair_bytes):
+            ranges = [r for j, r in enumerate(pair_bytes) if j != idx]
+            out.append((f"zero_{prefix}cpi01_omit_{name}_b{offset}", ranges))
+        return out
     if mode == "cpi01_omit":
         for idx, (name, offset, _size) in enumerate(pair_halves):
             ranges = [r for j, r in enumerate(pair_halves) if j != idx]
