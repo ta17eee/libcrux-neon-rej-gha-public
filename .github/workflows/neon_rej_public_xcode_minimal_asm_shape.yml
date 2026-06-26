@@ -57,21 +57,18 @@ jobs:
 
           sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
           lto_library="${developer_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib"
-          asm="$out_dir/minimal_shape.s"
-          obj="$out_dir/minimal_shape.o"
+          caller_asm="$out_dir/minimal_shape_caller.s"
+          callee_asm="$out_dir/minimal_shape_callee.s"
+          obj="$out_dir/minimal_shape_caller.o"
+          callee_obj="$out_dir/minimal_shape_callee.o"
 
-          cat > "$asm" <<'ASM'
+          cat > "$caller_asm" <<'ASM'
           .text
           .p2align 2
           .globl _main
           .private_extern _main
           _main:
           mov w0, #0
-          ret
-
-          .p2align 2
-          .globl _SIMD128Vector_rej_sample
-          _SIMD128Vector_rej_sample:
           ret
 
           .p2align 2
@@ -127,11 +124,28 @@ jobs:
           .quad 0x0123456789abcdef
           ASM
 
-          DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$asm" -o "$obj" > "$out_dir/assemble.log" 2>&1
-          assemble_status=$?
+          cat > "$callee_asm" <<'ASM'
+          .text
+          .p2align 2
+          .globl _SIMD128Vector_rej_sample
+          _SIMD128Vector_rej_sample:
+          ret
+          ASM
+
+          : > "$out_dir/assemble.log"
+          DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$caller_asm" -o "$obj" >> "$out_dir/assemble.log" 2>&1
+          caller_assemble_status=$?
+          DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$callee_asm" -o "$callee_obj" >> "$out_dir/assemble.log" 2>&1
+          callee_assemble_status=$?
+          assemble_status=0
+          if [ "$caller_assemble_status" -ne 0 ] || [ "$callee_assemble_status" -ne 0 ]; then
+            assemble_status=1
+          fi
           object_sha="NA"
           if [ "$assemble_status" -eq 0 ]; then
-            object_sha="$(shasum -a 256 "$obj" | awk '{print $1}')"
+            caller_sha="$(shasum -a 256 "$obj" | awk '{print $1}')"
+            callee_sha="$(shasum -a 256 "$callee_obj" | awk '{print $1}')"
+            object_sha="${caller_sha}+${callee_sha}"
           fi
 
           add_hex() {
@@ -222,6 +236,7 @@ jobs:
               -nodefaultlibs
               -o "$bin"
               "$obj"
+              "$callee_obj"
               -lSystem
               -lc
               -Wl,-u,_case_b9fa
@@ -255,6 +270,7 @@ jobs:
               -syslibroot "$sdkroot"
               -o "$bin"
               "$obj"
+              "$callee_obj"
               -lSystem
               -lc
               -u _case_b9fa
@@ -292,14 +308,22 @@ jobs:
             echo "## Assembly"
             echo
             echo "- assemble_status: \`${assemble_status}\`"
+            echo "- caller_assemble_status: \`${caller_assemble_status}\`"
+            echo "- callee_assemble_status: \`${callee_assemble_status}\`"
             echo "- object_sha256: \`${object_sha}\`"
             echo "- b9fa object target: \`${object_b9fa}\`"
             echo "- 0c67 object target: \`${object_0c67}\`"
             echo
-            echo "### Source"
+            echo "### Caller source"
             echo
             echo "\`\`\`asm"
-            sed -n '1,220p' "$asm"
+            sed -n '1,220p' "$caller_asm"
+            echo "\`\`\`"
+            echo
+            echo "### Callee source"
+            echo
+            echo "\`\`\`asm"
+            sed -n '1,80p' "$callee_asm"
             echo "\`\`\`"
             echo
             echo "### Object relocations"
