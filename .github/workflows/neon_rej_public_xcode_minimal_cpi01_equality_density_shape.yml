@@ -1,0 +1,454 @@
+name: NEON rejection sampler public Xcode minimal CPI01 equality density shape
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  minimal-cpi01-equality-density-shape:
+    name: minimal CPI01 equality density shape
+    runs-on: macos-14
+
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Build and link scaled CPI equality assembly shapes
+        run: |
+          set +e
+          developer_dir="/Applications/Xcode_15.0.1.app/Contents/Developer"
+          out_dir="$PWD/neon-rej-diagnostics/minimal-cpi01-equality-density-shape"
+          mkdir -p "$out_dir"
+          summary="$out_dir/summary.md"
+          rows="$out_dir/summary.rows.tsv"
+
+          {
+            echo "# Minimal CPI01 equality density-shape probe"
+            echo
+            echo "Developer dir: \`${developer_dir}\`"
+            echo
+            echo "## Runner and toolchain"
+            echo
+            echo "\`\`\`text"
+            sw_vers
+            uname -a
+            sysctl hw.optional.AdvSIMD || true
+            DEVELOPER_DIR="${developer_dir}" xcodebuild -version || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find clang || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --find ld || true
+            DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path || true
+            DEVELOPER_DIR="${developer_dir}" ld -v || true
+            DEVELOPER_DIR="${developer_dir}" ld -version_details || true
+            echo "\`\`\`"
+            echo
+          } > "$summary" 2>&1
+
+          printf 'density\tcase\tlink_variant\tassemble_status\tlink_status\tobject_line\tfinal_line\tobject_expected_count\tfinal_expected_count\tfinal_corrupt_ordinary_count\tfinal_corrupt_plus_neon_count\ttext_relocs\tliteral16_size\ttext_size\tobject_size\tobject_sha256\tfinal_sha256\n' > "$rows"
+
+          if [ ! -d "${developer_dir}" ]; then
+            printf 'missing_xcode\tall\tNA\tNA\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' >> "$rows"
+            cat "$summary"
+            exit 0
+          fi
+
+          sdkroot="$(DEVELOPER_DIR="${developer_dir}" xcrun --show-sdk-path)"
+          callee_asm="$out_dir/callee.s"
+          callee_obj="$out_dir/callee.o"
+
+          cat > "$callee_asm" <<'ASM'
+          .text
+          .p2align 2
+          .globl _SIMD128Vector_rej_sample
+          _SIMD128Vector_rej_sample:
+          ret
+          ASM
+
+          DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$callee_asm" -o "$callee_obj" > "$out_dir/callee.assemble.log" 2>&1
+          callee_status=$?
+
+          count_bytes() {
+            local path="$1"
+            local pattern="$2"
+            python3 - "$path" "$pattern" <<'PY'
+          import sys
+          path, pattern = sys.argv[1:]
+          try:
+              data = open(path, "rb").read()
+          except OSError:
+              print("NA")
+              raise SystemExit(0)
+          needle = bytes(int(x, 16) for x in pattern.split())
+          count = 0
+          start = 0
+          while True:
+              idx = data.find(needle, start)
+              if idx < 0:
+                  break
+              count += 1
+              start = idx + 1
+          print(count)
+          PY
+          }
+
+          section_size() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              $1 == "sectname" && $2 == s { in_section=1; next }
+              in_section && $1 == "size" { print $2; found=1; exit }
+              END { if (!found) print "NA" }
+            ' "$file"
+          }
+
+          count_relocs() {
+            local file="$1"
+            local section="$2"
+            awk -v s="$section" '
+              index($0, "Relocation information (" s ")") { print $(NF-1); found=1 }
+              END { if (!found) print 0 }
+            ' "$file"
+          }
+
+          target_line() {
+            local path="$1"
+            local symbol="$2"
+            local out_file="$3"
+            local nm_file="$out_file.nm.txt"
+            local dis_file="$out_file.window"
+            local symbol_addr start_addr stop_addr
+            nm -nm "$path" > "$nm_file" 2>&1
+            symbol_addr="$(awk -v s="$symbol" '$0 ~ s { print $1; exit }' "$nm_file")"
+            if ! printf '%s' "$symbol_addr" | grep -Eq '^[0-9a-fA-F]+$'; then
+              echo "missing" > "$out_file"
+              return 0
+            fi
+            start_addr="$(python3 - "$symbol_addr" <<'PY'
+          import sys
+          print(hex(max(0, int(sys.argv[1], 16) - 0x60)))
+          PY
+          )"
+            stop_addr="$(python3 - "$symbol_addr" <<'PY'
+          import sys
+          print(hex(int(sys.argv[1], 16) + 0x60))
+          PY
+          )"
+            DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump \
+              --macho --arch=arm64 --disassemble \
+              --start-address="${start_addr}" --stop-address="${stop_addr}" \
+              "$path" > "$dis_file" 2>&1
+            python3 - "$dis_file" "$symbol_addr" "$out_file" <<'PY'
+          import re, sys
+          path, target_s, out = sys.argv[1:]
+          target = int(target_s, 16)
+          found = "missing"
+          for line in open(path, errors="replace"):
+              m = re.match(r"\s*([0-9a-fA-F]+):\s*(.*)", line)
+              if m and int(m.group(1), 16) == target:
+                  found = line.strip()
+                  break
+          open(out, "w").write(found + "\n")
+          PY
+          }
+
+          emit_case_asm() {
+            local density="$1"
+            local case_name="$2"
+            local cpi0="$3"
+            local cpi1="$4"
+            local cpi2="$5"
+            local asm="$out_dir/density-${density}/${case_name}.s"
+            python3 - "$asm" "$density" "$case_name" "$cpi0" "$cpi1" "$cpi2" <<'PY'
+          import sys
+
+          path, density_s, case_name, cpi0, cpi1, cpi2 = sys.argv[1:]
+          density = int(density_s)
+
+          def qwords(text):
+              a, b = text.split(",", 1)
+              return a, b
+
+          def emit_dummy(f, i):
+              f.write(f"""
+          .p2align 2
+          .globl _dummy_{case_name}_{i}
+          .private_extern _dummy_{case_name}_{i}
+          _dummy_{case_name}_{i}:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          bl _SIMD128Vector_rej_sample
+          adrp x10, L_{case_name}_dummy_cpi_{i}@PAGE
+          add x10, x10, L_{case_name}_dummy_cpi_{i}@PAGEOFF
+          ldr q3, [x10]
+          ret
+          .cfi_endproc
+          """)
+
+          c0a, c0b = qwords(cpi0)
+          c1a, c1b = qwords(cpi1)
+          c2a, c2b = qwords(cpi2)
+
+          with open(path, "w") as f:
+              f.write(f"""
+          .subsections_via_symbols
+          .text
+          .p2align 2
+          .globl _main
+          .private_extern _main
+          _main:
+          mov w0, #0
+          ret
+
+          .p2align 2
+          .globl _keep_all_{case_name}
+          _keep_all_{case_name}:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          """)
+              for i in range(density):
+                  f.write(f"bl _dummy_{case_name}_{i}\n")
+              f.write("""
+          ret
+          .cfi_endproc
+          """)
+
+              before = density // 2
+              for i in range(before):
+                  emit_dummy(f, i)
+
+              f.write(f"""
+          .p2align 2
+          .globl _case_{case_name}
+          _case_{case_name}:
+          .cfi_startproc
+          .cfi_def_cfa sp, 0
+          sub sp, sp, #64
+          adrp x9, L_{case_name}_cpi0@PAGE
+          add x9, x9, L_{case_name}_cpi0@PAGEOFF
+          ldr q0, [x9]
+          str q0, [sp]
+          .rept 32
+          nop
+          .endr
+          bl _SIMD128Vector_rej_sample
+          ldr x3, [sp]
+          adrp x7, L_{case_name}_cpi2@PAGE
+          add x7, x7, L_{case_name}_cpi2@PAGEOFF
+          ldr q2, [x7]
+          adrp x5, L_{case_name}_cpi1@PAGE
+          add x5, x5, L_{case_name}_cpi1@PAGEOFF
+          ldr q1, [x5]
+          .rept 4
+          nop
+          .endr
+          .globl _target_{case_name}
+          _target_{case_name}:
+          mov x28, x3
+          add sp, sp, #64
+          ret
+          .cfi_endproc
+          """)
+
+              for i in range(before, density):
+                  emit_dummy(f, i)
+
+              f.write(f"""
+          .section __TEXT,__literal16,16byte_literals
+          .p2align 4
+          L_{case_name}_cpi0:
+          .quad {c0a}
+          .quad {c0b}
+          L_{case_name}_cpi1:
+          .quad {c1a}
+          .quad {c1b}
+          L_{case_name}_cpi2:
+          .quad {c2a}
+          .quad {c2b}
+          """)
+              for i in range(density):
+                  lo = (i * 0x9e3779b97f4a7c15) & ((1 << 64) - 1)
+                  hi = (lo ^ 0xffffffffffffffff) & ((1 << 64) - 1)
+                  f.write(f"L_{case_name}_dummy_cpi_{i}:\n")
+                  f.write(f".quad 0x{lo:016x}\n")
+                  f.write(f".quad 0x{hi:016x}\n")
+          PY
+          }
+
+          assemble_case() {
+            local density="$1"
+            local case_name="$2"
+            local dir="$out_dir/density-${density}"
+            local obj="$dir/${case_name}.o"
+            DEVELOPER_DIR="${developer_dir}" xcrun clang -arch arm64 -c "$dir/${case_name}.s" -o "$obj" > "$dir/${case_name}.assemble.log" 2>&1
+            printf '%s\n' "$?" > "$dir/${case_name}.assemble.status"
+            if [ -f "$obj" ]; then
+              DEVELOPER_DIR="${developer_dir}" xcrun llvm-objdump --macho --arch=arm64 --reloc "$obj" > "$dir/${case_name}.object.relocs.txt" 2>&1 || true
+              otool -l "$obj" > "$dir/${case_name}.otool-load-commands.txt" 2>&1 || true
+              target_line "$obj" "_target_${case_name}" "$dir/${case_name}.object.target-line.txt"
+            fi
+          }
+
+          link_case() {
+            local density="$1"
+            local case_name="$2"
+            local link_variant="$3"
+            local use_classic="$4"
+            local dir="$out_dir/density-${density}"
+            local obj="$dir/${case_name}.o"
+            local link_dir="$dir/${case_name}.${link_variant}"
+            local bin="$link_dir/${case_name}.${link_variant}"
+            local map="$link_dir/${case_name}.${link_variant}.map"
+            mkdir -p "$link_dir"
+            local args=(
+              -demangle
+              -dynamic
+              -arch arm64
+              -platform_version macos 14.0.0 14.0
+              -syslibroot "$sdkroot"
+              -o "$bin"
+              "$obj"
+              "$callee_obj"
+              -lSystem
+              -lc
+              -u "_case_${case_name}"
+              -u "_keep_all_${case_name}"
+              -dead_strip
+              -map "$map"
+            )
+            if [ "$use_classic" = "yes" ]; then
+              args+=(-ld_classic)
+            fi
+            {
+              printf 'DEVELOPER_DIR=%q xcrun ld' "$developer_dir"
+              printf ' %q' "${args[@]}"
+              echo
+            } > "$link_dir/ld-command.txt"
+            DEVELOPER_DIR="${developer_dir}" xcrun ld "${args[@]}" > "$link_dir/link.log" 2>&1
+            printf '%s\n' "$?" > "$link_dir/status.txt"
+            echo "$bin"
+          }
+
+          record_case() {
+            local density="$1"
+            local case_name="$2"
+            local link_variant="$3"
+            local bin="$4"
+            local status="$5"
+            local dir="$out_dir/density-${density}"
+            local obj="$dir/${case_name}.o"
+            local link_dir="$dir/${case_name}.${link_variant}"
+            local assemble_status object_line final_line object_expected final_expected final_corrupt_ordinary final_corrupt_plus object_sha final_sha text_relocs literal16_size text_size object_size
+            assemble_status="$(cat "$dir/${case_name}.assemble.status" 2>/dev/null || echo 1)"
+            object_line="$(cat "$dir/${case_name}.object.target-line.txt" 2>/dev/null || echo missing)"
+            object_expected="$(count_bytes "$obj" "fc 03 03 aa")"
+            object_sha="$(shasum -a 256 "$obj" 2>/dev/null | awk '{print $1}')"
+            object_size="$(stat -f '%z' "$obj" 2>/dev/null || echo NA)"
+            text_relocs="$(count_relocs "$dir/${case_name}.object.relocs.txt" "__TEXT,__text")"
+            literal16_size="$(section_size "$dir/${case_name}.otool-load-commands.txt" "__literal16")"
+            text_size="$(section_size "$dir/${case_name}.otool-load-commands.txt" "__text")"
+            final_line="missing"
+            final_expected="NA"
+            final_corrupt_ordinary="NA"
+            final_corrupt_plus="NA"
+            final_sha="NA"
+            if [ "$status" -eq 0 ]; then
+              target_line "$bin" "_target_${case_name}" "$link_dir/final.target-line.txt"
+              final_line="$(cat "$link_dir/final.target-line.txt")"
+              final_expected="$(count_bytes "$bin" "fc 03 03 aa")"
+              final_corrupt_ordinary="$(count_bytes "$bin" "fc 0f 01 aa")"
+              final_corrupt_plus="$(count_bytes "$bin" "fc 7f 00 aa")"
+              final_sha="$(shasum -a 256 "$bin" 2>/dev/null | awk '{print $1}')"
+            fi
+            {
+              echo "## density ${density} / ${case_name} / ${link_variant}"
+              echo
+              echo "- assemble_status: \`${assemble_status}\`"
+              echo "- link_status: \`${status}\`"
+              echo "- object target: \`${object_line}\`"
+              echo "- final target: \`${final_line}\`"
+              echo "- text_relocs: \`${text_relocs}\`"
+              echo "- literal16_size: \`${literal16_size}\`"
+              echo "- text_size: \`${text_size}\`"
+              echo "- object_size: \`${object_size}\`"
+              echo
+              echo "### final target window"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/final.target-line.txt.window" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+              echo "### link log"
+              echo
+              echo "\`\`\`text"
+              cat "$link_dir/link.log" 2>/dev/null || true
+              echo "\`\`\`"
+              echo
+            } >> "$summary"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$density" "$case_name" "$link_variant" "$assemble_status" "$status" \
+              "${object_line//$'\t'/ }" "${final_line//$'\t'/ }" \
+              "$object_expected" "$final_expected" "$final_corrupt_ordinary" "$final_corrupt_plus" \
+              "$text_relocs" "$literal16_size" "$text_size" "$object_size" "${object_sha:-NA}" "$final_sha" >> "$rows"
+          }
+
+          cpi0_orig="0xffffffffff020100,0xffffffffffffffff"
+          cpi1_orig="0x0504040302010100,0x0b0a0a0908070706"
+          cpi2_orig="0x0008000400020001,0x0080004000200010"
+          cpi_ff="0xffffffffffffffff,0xffffffffffffffff"
+          cpi_flip="0xffffffffff020100,0xfffffffffffffffe"
+
+          for density in 0 512 2048; do
+            mkdir -p "$out_dir/density-${density}"
+            emit_case_asm "$density" distinct "$cpi0_orig" "$cpi1_orig" "$cpi2_orig"
+            emit_case_asm "$density" cpi01_both_ff "$cpi_ff" "$cpi_ff" "$cpi2_orig"
+            emit_case_asm "$density" cpi01_flip "$cpi0_orig" "$cpi_flip" "$cpi2_orig"
+            for case_name in distinct cpi01_both_ff cpi01_flip; do
+              assemble_case "$density" "$case_name"
+              assemble_status="$(cat "$out_dir/density-${density}/${case_name}.assemble.status" 2>/dev/null || echo 1)"
+              {
+                echo "## density ${density} / ${case_name} assembly"
+                echo
+                echo "- assemble_status: \`${assemble_status}\`"
+                echo "- object target: \`$(cat "$out_dir/density-${density}/${case_name}.object.target-line.txt" 2>/dev/null || echo missing)\`"
+                echo "- source: \`density-${density}/${case_name}.s\`"
+                echo
+                echo "### object relocations head"
+                echo
+                echo "\`\`\`text"
+                sed -n '1,80p' "$out_dir/density-${density}/${case_name}.object.relocs.txt" 2>/dev/null || true
+                echo "\`\`\`"
+                echo
+                echo "### assemble log"
+                echo
+                echo "\`\`\`text"
+                cat "$out_dir/density-${density}/${case_name}.assemble.log" 2>/dev/null || true
+                echo "\`\`\`"
+                echo
+              } >> "$summary"
+              if [ "$assemble_status" -ne 0 ] || [ "$callee_status" -ne 0 ]; then
+                printf '%s\t%s\tassemble_failed\t%s\tNA\tmissing\tmissing\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' "$density" "$case_name" "$assemble_status" >> "$rows"
+                continue
+              fi
+              for link_variant in ld_new_no_lto ld_classic_no_lto; do
+                if [ "$link_variant" = "ld_classic_no_lto" ]; then
+                  bin="$(link_case "$density" "$case_name" "$link_variant" yes)"
+                else
+                  bin="$(link_case "$density" "$case_name" "$link_variant" no)"
+                fi
+                status="$(cat "$out_dir/density-${density}/${case_name}.${link_variant}/status.txt")"
+                record_case "$density" "$case_name" "$link_variant" "$bin" "$status"
+              done
+            done
+          done
+
+          cat "$summary"
+          exit 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-minimal-cpi01-equality-density-shape
+          path: neon-rej-diagnostics/**
