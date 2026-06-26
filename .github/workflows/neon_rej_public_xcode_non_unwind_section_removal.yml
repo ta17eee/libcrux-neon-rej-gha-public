@@ -303,47 +303,59 @@ jobs:
             local dir="$out_dir/objects/${variant}"
             local output="$dir/selected-object.o"
             mkdir -p "$dir"
-            otool -l "$selected_obj" > "$dir/source.otool-load-commands.txt" 2>&1 || true
-            local args=()
-            local section section_size zero_file safe_name
-            for section in "$@"; do
-              section_size="$(python3 - "$dir/source.otool-load-commands.txt" "$section" <<'PY'
+            python3 - "$selected_obj" "$output" "$@" > "$dir/transform.log" 2>&1 <<'PY'
+          import struct
           import sys
-          path, target = sys.argv[1:]
-          target_seg, target_sect = target.split(",", 1)
-          cur = {}
-          for line in open(path, errors="replace"):
-              parts = line.strip().split()
-              if len(parts) >= 2 and parts[0] == "sectname":
-                  cur = {"sect": parts[1]}
-              elif len(parts) >= 2 and parts[0] == "segname" and cur:
-                  cur["seg"] = parts[1]
-              elif len(parts) >= 2 and parts[0] == "size" and cur:
-                  cur["size"] = parts[1]
-              elif len(parts) >= 2 and parts[0] == "flags" and cur:
-                  if cur.get("seg") == target_seg and cur.get("sect") == target_sect:
-                      print(cur.get("size", "missing"))
-                      raise SystemExit(0)
-                  cur = {}
-          print("missing")
+
+          src, dst, *targets = sys.argv[1:]
+          targets = set(targets)
+          data = bytearray(open(src, "rb").read())
+
+          def cstr(raw):
+              return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+          if len(data) < 32:
+              print("file too small for mach_header_64")
+              raise SystemExit(2)
+          magic, = struct.unpack_from("<I", data, 0)
+          if magic != 0xfeedfacf:
+              print(f"unexpected Mach-O magic 0x{magic:08x}")
+              raise SystemExit(2)
+          ncmds, = struct.unpack_from("<I", data, 16)
+          off = 32
+          found = {}
+          for _ in range(ncmds):
+              if off + 8 > len(data):
+                  print("truncated load command")
+                  raise SystemExit(2)
+              cmd, cmdsize = struct.unpack_from("<II", data, off)
+              if cmd == 0x19:  # LC_SEGMENT_64
+                  nsects, = struct.unpack_from("<I", data, off + 64)
+                  sec_off = off + 72
+                  for _ in range(nsects):
+                      sect = cstr(data[sec_off:sec_off + 16])
+                      seg = cstr(data[sec_off + 16:sec_off + 32])
+                      size, = struct.unpack_from("<Q", data, sec_off + 40)
+                      file_offset, = struct.unpack_from("<I", data, sec_off + 48)
+                      name = f"{seg},{sect}"
+                      if name in targets:
+                          end = file_offset + size
+                          if end > len(data):
+                              print(f"{name}: section data out of range offset={file_offset} size={size}")
+                              raise SystemExit(2)
+                          data[file_offset:end] = b"\0" * size
+                          found[name] = (file_offset, size)
+                      sec_off += 80
+              off += cmdsize
+          missing = sorted(targets - set(found))
+          if missing:
+              print("missing sections: " + " ".join(missing))
+              raise SystemExit(44)
+          with open(dst, "wb") as f:
+              f.write(data)
+          for name, (file_offset, size) in sorted(found.items()):
+              print(f"zeroed {name} offset={file_offset} size={size}")
           PY
-              )"
-              if ! printf '%s' "$section_size" | grep -Eq '^0x[0-9a-fA-F]+$'; then
-                echo "missing section ${section}" > "$dir/transform.log"
-                printf '%s\n' 44
-                return 0
-              fi
-              safe_name="$(printf '%s' "$section" | tr ',/' '__')"
-              zero_file="$dir/zero-${safe_name}.bin"
-              python3 - "$section_size" "$zero_file" <<'PY'
-          import sys
-          size = int(sys.argv[1], 16)
-          with open(sys.argv[2], "wb") as f:
-              f.write(b"\0" * size)
-          PY
-              args+=(--update-section="${section}=${zero_file}")
-            done
-            "$objcopy_tool" "${args[@]}" "$selected_obj" "$output" > "$dir/transform.log" 2>&1
             printf '%s\n' "$?"
           }
 
