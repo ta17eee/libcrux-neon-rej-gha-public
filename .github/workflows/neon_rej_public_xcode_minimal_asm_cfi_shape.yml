@@ -320,14 +320,14 @@ jobs:
               compact_unwind_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__LD,__compact_unwind")"
               eh_frame_relocs="$(count_relocs "$meta_dir/objdump-relocs.txt" "__TEXT,__eh_frame")"
               dwarf_sections="$(grep -c '__DWARF' "$meta_dir/otool-load-commands.txt" || true)"
-              target_line "${object_variant}-b9fa-object" "$obj" "_case_b9fa" "0x151c" "$meta_dir/object.b9fa.target-line.txt"
+              target_line "${object_variant}-b9fa-object" "$obj" "_case_b9fa" "0x1514" "$meta_dir/object.b9fa.target-line.txt"
               target_line "${object_variant}-0c67-object" "$obj" "_case_0c67" "0x2d3c" "$meta_dir/object.0c67.target-line.txt"
               object_b9fa="$(cat "$meta_dir/object.b9fa.target-line.txt")"
               object_0c67="$(cat "$meta_dir/object.0c67.target-line.txt")"
             fi
             if [ "$link_status" -eq 0 ]; then
               final_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
-              target_line "${object_variant}-${link_variant}-b9fa-final" "$bin" "_case_b9fa" "0x151c" "$link_dir/final.b9fa.target-line.txt"
+              target_line "${object_variant}-${link_variant}-b9fa-final" "$bin" "_case_b9fa" "0x1514" "$link_dir/final.b9fa.target-line.txt"
               target_line "${object_variant}-${link_variant}-0c67-final" "$bin" "_case_0c67" "0x2d3c" "$link_dir/final.0c67.target-line.txt"
               final_b9fa="$(cat "$link_dir/final.b9fa.target-line.txt")"
               final_0c67="$(cat "$link_dir/final.0c67.target-line.txt")"
