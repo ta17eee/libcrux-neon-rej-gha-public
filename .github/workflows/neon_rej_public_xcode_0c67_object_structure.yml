@@ -120,13 +120,20 @@ jobs:
           echo "RUSTFLAGS=${rustflags}" | tee "${out}/rustflags.txt"
           RUSTFLAGS="${rustflags}" cargo +1.78.0 test ${PROBE_CARGO_ARGS} > "${out}/build.log" 2>&1
 
-          find target/release -name '*.o' -print0 \
-            | xargs -0 nm -nm > "${out}/all-object-nm.txt"
+          : > "${out}/all-object-nm.txt"
+          : > "${out}/all-object-nm-errors.txt"
+          while IFS= read -r obj; do
+            {
+              echo "${obj}:"
+              xcrun llvm-nm -nm "${obj}"
+              echo
+            } >> "${out}/all-object-nm.txt" 2>> "${out}/all-object-nm-errors.txt" || true
+          done < <(find target/release -name '*.o' | sort)
           grep -B1 -A3 "${PROBE_TARGET_HASH}" "${out}/all-object-nm.txt" > "${out}/target-object-nm-grep.txt" || true
 
           selected=""
           while IFS= read -r obj; do
-            if nm -nm "${obj}" | grep -q "${PROBE_TARGET_HASH}"; then
+            if xcrun llvm-nm -nm "${obj}" | grep -q "${PROBE_TARGET_HASH}"; then
               echo "${obj}" >> "${out}/object-candidates.txt"
               base="$(basename "${obj}")"
               if [ -z "${selected}" ] || [[ "${base}" == ${PROBE_PREFERRED_OBJECT_PREFIX}* ]]; then
