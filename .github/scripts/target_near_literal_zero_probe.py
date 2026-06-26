@@ -445,11 +445,19 @@ def target_line(path, target_hash, target_offset_hex, out_dir, prefix, developer
     if symbol_addr is None:
         return "missing"
     target = add_hex(hex(symbol_addr), target_offset_hex)
+    start_addr = hex(max(0, target - 0x40))
+    stop_addr = hex(target + 0x50)
     dis_path = out_dir / f"{prefix}.disassembly.txt"
     env = os.environ.copy()
     env["DEVELOPER_DIR"] = developer_dir
     proc = subprocess.run(
-        ["xcrun", "llvm-objdump", "--macho", "--arch=arm64", "--demangle", "--disassemble", str(path)],
+        [
+            "xcrun", "llvm-objdump",
+            "--macho", "--arch=arm64", "--demangle", "--disassemble",
+            "--start-address", start_addr,
+            "--stop-address", stop_addr,
+            str(path),
+        ],
         env=env,
         text=True,
         stdout=subprocess.PIPE,
