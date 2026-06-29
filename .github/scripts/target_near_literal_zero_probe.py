@@ -81,6 +81,47 @@ def macho_sections(data):
     return sections
 
 
+def macho_section_records(data):
+    if len(data) < 32:
+        raise ValueError("file too small for mach_header_64")
+    magic, = struct.unpack_from("<I", data, 0)
+    if magic != 0xfeedfacf:
+        raise ValueError(f"unexpected Mach-O magic 0x{magic:08x}")
+    ncmds, = struct.unpack_from("<I", data, 16)
+    off = 32
+    sections = []
+    for _ in range(ncmds):
+        if off + 8 > len(data):
+            raise ValueError("truncated load command")
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == 0x19:  # LC_SEGMENT_64
+            nsects, = struct.unpack_from("<I", data, off + 64)
+            sec_off = off + 72
+            for _ in range(nsects):
+                sect = cstr(data[sec_off:sec_off + 16])
+                seg = cstr(data[sec_off + 16:sec_off + 32])
+                addr, size = struct.unpack_from("<QQ", data, sec_off + 32)
+                file_offset, align, reloff, nreloc = struct.unpack_from("<IIII", data, sec_off + 48)
+                flags, reserved1, reserved2, reserved3 = struct.unpack_from("<IIII", data, sec_off + 64)
+                sections.append({
+                    "seg": seg,
+                    "sect": sect,
+                    "addr": addr,
+                    "size": size,
+                    "offset": file_offset,
+                    "align": align,
+                    "reloff": reloff,
+                    "nreloc": nreloc,
+                    "flags": flags,
+                    "reserved1": reserved1,
+                    "reserved2": reserved2,
+                    "reserved3": reserved3,
+                })
+                sec_off += 80
+        off += cmdsize
+    return sections
+
+
 def macho_symtab(data):
     if len(data) < 32:
         raise ValueError("file too small for mach_header_64")
@@ -255,6 +296,128 @@ def transform_cpi_nlists(src, dst, symbols, mode, log_path):
             )
         else:
             lines.append(f"new {name}: not found by name")
+    Path(dst).write_bytes(data)
+    Path(log_path).write_text("\n".join(lines) + "\n")
+    return 0
+
+
+def object_symbol_addr(path, target_hash):
+    nm_text = output(["nm", "-nm", str(path)])
+    for line in nm_text.splitlines():
+        if target_hash in line:
+            return int(line.split()[0], 16)
+    return None
+
+
+def relocation_kind(word):
+    return {
+        "symbolnum": word & 0x00ffffff,
+        "pcrel": (word >> 24) & 1,
+        "length": (word >> 25) & 3,
+        "extern": (word >> 27) & 1,
+        "type": (word >> 28) & 15,
+    }
+
+
+def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offset_hex, log_path):
+    data = bytearray(Path(src).read_bytes())
+    found = nlist_symbols_by_name(data, symbols)
+    missing = sorted(set(symbols) - set(found))
+    lines = []
+    if missing:
+        lines.append("missing symbols: " + " ".join(missing))
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 44
+
+    sections = macho_section_records(data)
+    text = next((s for s in sections if s["seg"] == "__TEXT" and s["sect"] == "__text"), None)
+    if text is None:
+        lines.append("missing __TEXT,__text")
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 44
+
+    s0, s1, s2 = symbols[:3]
+    rules = {
+        "all_1_to_0": (s1, s0, "all"),
+        "all_0_to_1": (s0, s1, "all"),
+        "all_2_to_1": (s2, s1, "all"),
+        "all_1_to_2": (s1, s2, "all"),
+        "all_2_to_0": (s2, s0, "all"),
+        "near_1_to_0": (s1, s0, "near"),
+        "near_1_to_2": (s1, s2, "near"),
+        "near_2_to_1": (s2, s1, "near"),
+        "near_2_to_0": (s2, s0, "near"),
+        "early_0_to_1": (s0, s1, "early"),
+    }
+    if mode not in rules:
+        lines.append(f"unknown text relocation transform mode: {mode}")
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 2
+    src_name, dst_name, scope = rules[mode]
+    src_index = found[src_name]["index"]
+    dst_index = found[dst_name]["index"]
+
+    symbol_addr = object_symbol_addr(src, target_hash)
+    target_addr = None
+    if symbol_addr is not None:
+        target_addr = symbol_addr + int(target_offset_hex, 16)
+
+    def in_scope(rel_addr):
+        if scope == "all":
+            return True
+        if target_addr is None:
+            return False
+        delta = target_addr - rel_addr
+        if scope == "near":
+            return 0 < delta <= 0x60
+        if scope == "early":
+            return delta > 0x100
+        return False
+
+    lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
+    lines.append(
+        f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
+        f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
+    )
+    if target_addr is None:
+        lines.append(f"target_hash {target_hash} not found")
+    else:
+        lines.append(f"target_addr=0x{target_addr:x}")
+    for name in symbols[:3]:
+        info = found[name]
+        lines.append(f"symbol {name}: index={info['index']} value=0x{info['value']:x}")
+
+    changed = 0
+    candidates = 0
+    for i in range(text["nreloc"]):
+        rel_off = text["reloff"] + i * 8
+        if rel_off + 8 > len(data):
+            lines.append(f"truncated relocation entry {i} at 0x{rel_off:x}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        r_address_u, r_word = struct.unpack_from("<II", data, rel_off)
+        if r_address_u & 0x80000000:
+            continue
+        bits = relocation_kind(r_word)
+        if not bits["extern"] or bits["symbolnum"] != src_index:
+            continue
+        rel_addr = text["addr"] + r_address_u
+        if not in_scope(rel_addr):
+            continue
+        candidates += 1
+        new_word = (r_word & 0xff000000) | dst_index
+        struct.pack_into("<I", data, rel_off + 4, new_word)
+        changed += 1
+        if changed <= 80:
+            delta_text = "NA" if target_addr is None else f"0x{target_addr - rel_addr:x}"
+            lines.append(
+                f"retarget rel[{i}] section_off=0x{r_address_u:x} addr=0x{rel_addr:x} "
+                f"delta_to_target={delta_text} type={bits['type']} len={bits['length']} "
+                f"pcrel={bits['pcrel']} word=0x{r_word:08x}->0x{new_word:08x}"
+            )
+    lines.append(f"changed={changed} candidates={candidates}")
+    if changed == 0:
+        lines.append("no relocation entries matched")
     Path(dst).write_bytes(data)
     Path(log_path).write_text("\n".join(lines) + "\n")
     return 0
@@ -489,7 +652,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -685,6 +848,24 @@ def cpi_nlist_transforms(prefix, symbols, mode):
         "swap_entries_12",
     ]
     return [(f"{prefix}cpi01_nlist_{m}", symbols[:3], m) for m in modes]
+
+
+def cpi_reloc_transforms(prefix, symbols, mode):
+    if mode != "cpi01_relocs" or len(symbols) < 3:
+        return []
+    modes = [
+        "all_1_to_0",
+        "all_0_to_1",
+        "all_2_to_1",
+        "all_1_to_2",
+        "all_2_to_0",
+        "near_1_to_0",
+        "near_1_to_2",
+        "near_2_to_1",
+        "near_2_to_0",
+        "early_0_to_1",
+    ]
+    return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
 
 
 def add_hex(a, b):
@@ -942,6 +1123,19 @@ def main():
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = transform_cpi_nlists(selected, dst, subset_symbols, mode, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, subset_symbols, mode in cpi_reloc_transforms(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = transform_cpi_text_relocs(
+                selected,
+                dst,
+                subset_symbols,
+                mode,
+                cfg["target_hash"],
+                cfg["target_offset_hex"],
+                log,
+            )
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     print(f"prepared variants={len(variants)} mode={cfg['cpi_subset_mode']}", flush=True)
