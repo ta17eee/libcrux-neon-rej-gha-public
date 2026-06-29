@@ -1230,7 +1230,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1429,8 +1429,25 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr_patch_pair_opcodes":
+        modes = [
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lw3dc000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lwfd4000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lwbd4000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lwf94000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lwb94000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lw910000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lw110000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lw3d8000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0800_aw90000005_lw3dc000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0800_aw90000005_lwfd4000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0800_aw90000005_lwf94000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0800_aw90000005_lw910000b8",
+            "addrpatchpairregs_1_adrp4_after3_at0800_aw90000005_lw3d8000b8",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_addr_patch_pair_regs":
         modes = [
             "addrpatchpairregs_1_adrp4_after3_at0400_aw90000005_lw3dc000b8",
