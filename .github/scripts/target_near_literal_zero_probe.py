@@ -339,6 +339,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     s0, s1, s2 = symbols[:3]
     names_by_ordinal = {"0": s0, "1": s1, "2": s2}
     single_match = re.fullmatch(r"single_([012])_to_([012])_(\d+)", mode)
+    set_match = re.fullmatch(r"(set|except)_([012])_to_([012])_([0-9_]+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -354,11 +355,19 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         "early_0_to_1": (s0, s1, "early"),
     }
     single_ordinal = None
+    ordinal_set = None
+    ordinal_set_kind = None
     if single_match:
         src_name = names_by_ordinal[single_match.group(1)]
         dst_name = names_by_ordinal[single_match.group(2)]
         scope = "single"
         single_ordinal = int(single_match.group(3))
+    elif set_match:
+        ordinal_set_kind = set_match.group(1)
+        src_name = names_by_ordinal[set_match.group(2)]
+        dst_name = names_by_ordinal[set_match.group(3)]
+        scope = "ordinal_set"
+        ordinal_set = {int(part) for part in set_match.group(4).split("_") if part}
     elif mode in rules:
         src_name, dst_name, scope = rules[mode]
     else:
@@ -392,6 +401,9 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
     if single_ordinal is not None:
         lines.append(f"single_ordinal={single_ordinal}")
+    if ordinal_set is not None:
+        ordinal_text = ",".join(str(i) for i in sorted(ordinal_set))
+        lines.append(f"ordinal_set_kind={ordinal_set_kind} ordinal_set={ordinal_text}")
     lines.append(
         f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
         f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
@@ -423,6 +435,12 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         source_seen += 1
         if single_ordinal is not None and source_ordinal != single_ordinal:
             continue
+        if ordinal_set is not None:
+            in_set = source_ordinal in ordinal_set
+            if ordinal_set_kind == "set" and not in_set:
+                continue
+            if ordinal_set_kind == "except" and in_set:
+                continue
         rel_addr = text["addr"] + r_address_u
         if not in_scope(rel_addr):
             continue
@@ -675,7 +693,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -874,8 +892,24 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_pairs":
+        ordinal_modes = [
+            "set_1_to_0_3_4",
+            "set_1_to_2_3_4",
+            "set_1_to_0_0_1_2",
+            "set_1_to_2_0_1_2",
+            "set_1_to_0_5_6_7_8_9_10_11",
+            "set_1_to_2_5_6_7_8_9_10_11",
+            "except_1_to_0_3",
+            "except_1_to_2_3",
+            "except_1_to_0_4",
+            "except_1_to_2_4",
+            "except_1_to_0_3_4",
+            "except_1_to_2_3_4",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in ordinal_modes]
     if mode == "cpi01_reloc_singles":
         modes = [
             "nonnear_1_to_0",
