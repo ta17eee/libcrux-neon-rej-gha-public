@@ -1081,7 +1081,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1280,8 +1280,21 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr_patch_adrp_fine":
+        modes = [
+            "addrpatchadrp_1_4_at0300",
+            "addrpatchadrp_1_4_at0340",
+            "addrpatchadrp_1_4_at0380",
+            "addrpatchadrp_1_4_at03c0",
+            "addrpatchadrp_1_4_at0400",
+            "addrpatchadrp_1_4_at0440",
+            "addrpatchadrp_1_4_at0480",
+            "addrpatchadrp_1_4_at04c0",
+            "addrpatchadrp_1_4_at0500",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_addr_patch_adrp_window":
         modes = [
             "addrpatchadrp_1_4_at0210",
