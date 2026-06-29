@@ -337,23 +337,34 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         return 44
 
     s0, s1, s2 = symbols[:3]
+    names_by_ordinal = {"0": s0, "1": s1, "2": s2}
+    single_match = re.fullmatch(r"single_([012])_to_([012])_(\d+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
         "all_2_to_1": (s2, s1, "all"),
         "all_1_to_2": (s1, s2, "all"),
         "all_2_to_0": (s2, s0, "all"),
+        "nonnear_1_to_0": (s1, s0, "nonnear"),
+        "nonnear_1_to_2": (s1, s2, "nonnear"),
         "near_1_to_0": (s1, s0, "near"),
         "near_1_to_2": (s1, s2, "near"),
         "near_2_to_1": (s2, s1, "near"),
         "near_2_to_0": (s2, s0, "near"),
         "early_0_to_1": (s0, s1, "early"),
     }
-    if mode not in rules:
+    single_ordinal = None
+    if single_match:
+        src_name = names_by_ordinal[single_match.group(1)]
+        dst_name = names_by_ordinal[single_match.group(2)]
+        scope = "single"
+        single_ordinal = int(single_match.group(3))
+    elif mode in rules:
+        src_name, dst_name, scope = rules[mode]
+    else:
         lines.append(f"unknown text relocation transform mode: {mode}")
         Path(log_path).write_text("\n".join(lines) + "\n")
         return 2
-    src_name, dst_name, scope = rules[mode]
     src_index = found[src_name]["index"]
     dst_index = found[dst_name]["index"]
 
@@ -370,11 +381,17 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         delta = target_addr - rel_addr
         if scope == "near":
             return 0 < delta <= 0x60
+        if scope == "nonnear":
+            return not (0 < delta <= 0x60)
         if scope == "early":
             return delta > 0x100
+        if scope == "single":
+            return True
         return False
 
     lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
+    if single_ordinal is not None:
+        lines.append(f"single_ordinal={single_ordinal}")
     lines.append(
         f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
         f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
@@ -389,6 +406,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
 
     changed = 0
     candidates = 0
+    source_seen = 0
     for i in range(text["nreloc"]):
         rel_off = text["reloff"] + i * 8
         if rel_off + 8 > len(data):
@@ -401,6 +419,10 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         bits = relocation_kind(r_word)
         if not bits["extern"] or bits["symbolnum"] != src_index:
             continue
+        source_ordinal = source_seen
+        source_seen += 1
+        if single_ordinal is not None and source_ordinal != single_ordinal:
+            continue
         rel_addr = text["addr"] + r_address_u
         if not in_scope(rel_addr):
             continue
@@ -412,10 +434,11 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             delta_text = "NA" if target_addr is None else f"0x{target_addr - rel_addr:x}"
             lines.append(
                 f"retarget rel[{i}] section_off=0x{r_address_u:x} addr=0x{rel_addr:x} "
-                f"delta_to_target={delta_text} type={bits['type']} len={bits['length']} "
+                f"source_ordinal={source_ordinal} delta_to_target={delta_text} "
+                f"type={bits['type']} len={bits['length']} "
                 f"pcrel={bits['pcrel']} word=0x{r_word:08x}->0x{new_word:08x}"
             )
-    lines.append(f"changed={changed} candidates={candidates}")
+    lines.append(f"changed={changed} candidates={candidates} source_seen={source_seen}")
     if changed == 0:
         lines.append("no relocation entries matched")
     Path(dst).write_bytes(data)
@@ -652,7 +675,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -851,8 +874,16 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode != "cpi01_relocs" or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_singles":
+        modes = [
+            "nonnear_1_to_0",
+            "nonnear_1_to_2",
+        ]
+        modes.extend(f"single_1_to_0_{i}" for i in range(12))
+        modes.extend(f"single_1_to_2_{i}" for i in range(12))
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     modes = [
         "all_1_to_0",
         "all_0_to_1",
