@@ -422,6 +422,14 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         lines.append(f"target_hash {target_hash} not found")
     else:
         lines.append(f"target_addr=0x{target_addr:x}")
+    lines.append(
+        f"src_symbol {src_name}: index={found[src_name]['index']} "
+        f"value=0x{found[src_name]['value']:x}"
+    )
+    lines.append(
+        f"dst_symbol {dst_name}: index={found[dst_name]['index']} "
+        f"value=0x{found[dst_name]['value']:x}"
+    )
     for name in symbols[:3]:
         info = found[name]
         lines.append(f"symbol {name}: index={info['index']} value=0x{info['value']:x}")
