@@ -347,6 +347,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     addrdupop_match = re.fullmatch(r"addrdupop_([0-9]+)_([0-9]+)_ge([0-9a-fA-F]+)_mask([0-9a-fA-F]+)", mode)
     addrpatchadrp_match = re.fullmatch(r"addrpatchadrp_([0-9]+)_([0-9]+)_at([0-9a-fA-F]+)", mode)
     addrpatchafter_match = re.fullmatch(r"addrpatchafter_([0-9]+)_([0-9]+)_at([0-9a-fA-F]+)", mode)
+    addrpatchafterword_match = re.fullmatch(r"addrpatchafterword_([0-9]+)_([0-9]+)_at([0-9a-fA-F]+)_w([0-9a-fA-F]+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -465,17 +466,19 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             "target_ordinal": int(addrpatchadrp_match.group(2)),
             "delta": int(addrpatchadrp_match.group(3), 16),
         }
-    elif addrpatchafter_match:
-        if addrpatchafter_match.group(1) not in names_by_ordinal:
+    elif addrpatchafter_match or addrpatchafterword_match:
+        match = addrpatchafter_match or addrpatchafterword_match
+        if match.group(1) not in names_by_ordinal:
             lines.append(f"unknown CPI ordinal in mode: {mode}")
             Path(log_path).write_text("\n".join(lines) + "\n")
             return 2
-        src_name = names_by_ordinal[addrpatchafter_match.group(1)]
+        src_name = names_by_ordinal[match.group(1)]
         dst_name = src_name
         scope = "address_edit"
         address_patch_after = {
-            "target_ordinal": int(addrpatchafter_match.group(2)),
-            "delta": int(addrpatchafter_match.group(3), 16),
+            "target_ordinal": int(match.group(2)),
+            "delta": int(match.group(3), 16),
+            "word": int(match.group(4), 16) if addrpatchafterword_match else None,
         }
     elif mode in rules:
         src_name, dst_name, scope = rules[mode]
@@ -815,6 +818,9 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
                 Path(log_path).write_text("\n".join(lines) + "\n")
                 return 44
             original_word, = struct.unpack_from("<I", data, original_word_off)
+            patched_word = address_patch_after["word"]
+            if patched_word is None:
+                patched_word = original_word
             source_addr = target_addr + delta
             if source_addr < text["addr"] or source_addr + 4 > text["addr"] + text["size"]:
                 lines.append(
@@ -835,14 +841,14 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
                 for i in range(text["nreloc"])
                 if text["reloff"] + i * 8 + 4 <= len(data)
             }
-            struct.pack_into("<I", data, source_word_off, original_word)
+            struct.pack_into("<I", data, source_word_off, patched_word)
             struct.pack_into("<I", data, target_entry["rel_off"], source_address)
             changed += 2
             lines.append(
                 f"patch_after_address ordinal={target_ordinal} rel[{target_entry['rel_index']}] "
                 f"0x{target_entry['address']:x}->0x{source_address:x} "
                 f"delta_from_target=0x{delta:x} old_word=0x{old_word:08x} "
-                f"new_word=0x{original_word:08x} "
+                f"original_word=0x{original_word:08x} new_word=0x{patched_word:08x} "
                 f"source_had_text_reloc={1 if source_address in rel_addresses else 0}"
             )
         for entry in source_entries:
@@ -1146,7 +1152,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1345,8 +1351,27 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr_patch_after_ldr_regs":
+        modes = [
+            "addrpatchafterword_1_3_at0400_w3dc000b8",
+            "addrpatchafterword_1_3_at0400_w3dc00098",
+            "addrpatchafterword_1_3_at0400_w3dc000d8",
+            "addrpatchafterword_1_3_at0400_w3dc003f8",
+            "addrpatchafterword_1_3_at0400_w3dc000a0",
+            "addrpatchafterword_1_3_at0400_w3dc000b7",
+            "addrpatchafterword_1_3_at0400_w3dc000b9",
+            "addrpatchafterword_1_3_at0400_w3dc000bf",
+            "addrpatchafterword_1_3_at0800_w3dc000b8",
+            "addrpatchafterword_1_3_at0800_w3dc00098",
+            "addrpatchafterword_1_3_at0800_w3dc000d8",
+            "addrpatchafterword_1_3_at0800_w3dc003f8",
+            "addrpatchafterword_1_3_at0800_w3dc000a0",
+            "addrpatchafterword_1_3_at0800_w3dc000b9",
+            "addrpatchafterword_1_3_at0800_w3dc000bf",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_addr_patch_after_exact":
         modes = [
             "addrpatchafter_1_3_at03f0",
