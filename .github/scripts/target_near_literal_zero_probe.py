@@ -396,6 +396,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             return delta > 0x100
         if scope == "single":
             return True
+        if scope == "ordinal_set":
+            return True
         return False
 
     lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
