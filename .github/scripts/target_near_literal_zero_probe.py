@@ -341,6 +341,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     single_match = re.fullmatch(r"single_([0-9]+)_to_([0-9]+)_(\d+)", mode)
     set_match = re.fullmatch(r"(set|except)_([0-9]+)_to_([0-9]+)_([0-9_]+)", mode)
     map_match = re.fullmatch(r"map_([0-9]+)_((?:[0-9]+to[0-9]+)(?:_[0-9]+to[0-9]+)*)", mode)
+    addrdup_match = re.fullmatch(r"addrdup_([0-9]+)_((?:[0-9]+from[0-9]+)(?:_[0-9]+from[0-9]+)*)", mode)
+    addrswap_match = re.fullmatch(r"addrswap_([0-9]+)_([0-9]+)_([0-9]+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -360,6 +362,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     ordinal_set_kind = None
     ordinal_dst_indexes = {}
     ordinal_dst_names = {}
+    address_dup_map = {}
+    address_swap_pair = None
     if single_match:
         if single_match.group(1) not in names_by_ordinal or single_match.group(2) not in names_by_ordinal:
             lines.append(f"unknown CPI ordinal in mode: {mode}")
@@ -396,6 +400,26 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             source_ordinal = int(source_text)
             dest_name = names_by_ordinal[dest_text]
             ordinal_dst_names[source_ordinal] = dest_name
+    elif addrdup_match:
+        if addrdup_match.group(1) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        src_name = names_by_ordinal[addrdup_match.group(1)]
+        dst_name = src_name
+        scope = "address_edit"
+        for part in addrdup_match.group(2).split("_"):
+            target_text, source_text = part.split("from", 1)
+            address_dup_map[int(target_text)] = int(source_text)
+    elif addrswap_match:
+        if addrswap_match.group(1) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        src_name = names_by_ordinal[addrswap_match.group(1)]
+        dst_name = src_name
+        scope = "address_edit"
+        address_swap_pair = (int(addrswap_match.group(2)), int(addrswap_match.group(3)))
     elif mode in rules:
         src_name, dst_name, scope = rules[mode]
     else:
@@ -430,6 +454,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             return True
         if scope == "ordinal_map":
             return True
+        if scope == "address_edit":
+            return True
         return False
 
     lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
@@ -444,6 +470,11 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             for source, dest in sorted(ordinal_dst_names.items())
         )
         lines.append(f"ordinal_dst_map={mapping_text}")
+    if address_dup_map:
+        dup_text = ", ".join(f"{target}<-{source}" for target, source in sorted(address_dup_map.items()))
+        lines.append(f"address_dup_map={dup_text}")
+    if address_swap_pair is not None:
+        lines.append(f"address_swap_pair={address_swap_pair[0]}<->{address_swap_pair[1]}")
     lines.append(
         f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
         f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
@@ -468,6 +499,77 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     for name in symbols[:3]:
         info = found[name]
         lines.append(f"symbol {name}: index={info['index']} value=0x{info['value']:x}")
+
+    if scope == "address_edit":
+        source_entries = []
+        for i in range(text["nreloc"]):
+            rel_off = text["reloff"] + i * 8
+            if rel_off + 8 > len(data):
+                lines.append(f"truncated relocation entry {i} at 0x{rel_off:x}")
+                Path(log_path).write_text("\n".join(lines) + "\n")
+                return 2
+            r_address_u, r_word = struct.unpack_from("<II", data, rel_off)
+            if r_address_u & 0x80000000:
+                continue
+            bits = relocation_kind(r_word)
+            if not bits["extern"] or bits["symbolnum"] != src_index:
+                continue
+            source_ordinal = len(source_entries)
+            source_entries.append({
+                "rel_index": i,
+                "rel_off": rel_off,
+                "address": r_address_u,
+                "word": r_word,
+                "bits": bits,
+                "ordinal": source_ordinal,
+            })
+        needed = set(address_dup_map) | set(address_dup_map.values())
+        if address_swap_pair is not None:
+            needed.update(address_swap_pair)
+        missing_ordinals = sorted(i for i in needed if i < 0 or i >= len(source_entries))
+        if missing_ordinals:
+            lines.append("missing source ordinals: " + " ".join(str(i) for i in missing_ordinals))
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 44
+        changed = 0
+        if address_swap_pair is not None:
+            left, right = address_swap_pair
+            left_entry = source_entries[left]
+            right_entry = source_entries[right]
+            struct.pack_into("<I", data, left_entry["rel_off"], right_entry["address"])
+            struct.pack_into("<I", data, right_entry["rel_off"], left_entry["address"])
+            changed += 2
+            lines.append(
+                f"swap_address ordinal={left} rel[{left_entry['rel_index']}] "
+                f"0x{left_entry['address']:x}->0x{right_entry['address']:x}; "
+                f"ordinal={right} rel[{right_entry['rel_index']}] "
+                f"0x{right_entry['address']:x}->0x{left_entry['address']:x}"
+            )
+        for target_ordinal, source_ordinal in sorted(address_dup_map.items()):
+            target_entry = source_entries[target_ordinal]
+            source_entry = source_entries[source_ordinal]
+            struct.pack_into("<I", data, target_entry["rel_off"], source_entry["address"])
+            changed += 1
+            lines.append(
+                f"dup_address ordinal={target_ordinal} rel[{target_entry['rel_index']}] "
+                f"0x{target_entry['address']:x}->0x{source_entry['address']:x} "
+                f"from ordinal={source_ordinal} rel[{source_entry['rel_index']}]"
+            )
+        for entry in source_entries:
+            if entry["ordinal"] <= 12:
+                rel_addr = text["addr"] + entry["address"]
+                delta_text = "NA" if target_addr is None else f"0x{target_addr - rel_addr:x}"
+                bits = entry["bits"]
+                lines.append(
+                    f"old_source ordinal={entry['ordinal']} rel[{entry['rel_index']}] "
+                    f"section_off=0x{entry['address']:x} addr=0x{rel_addr:x} "
+                    f"delta_to_target={delta_text} type={bits['type']} "
+                    f"pcrel={bits['pcrel']} word=0x{entry['word']:08x}"
+                )
+        lines.append(f"changed={changed} source_seen={len(source_entries)}")
+        Path(dst).write_bytes(data)
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 0
 
     changed = 0
     candidates = 0
@@ -754,7 +856,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -953,8 +1055,31 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr":
+        modes = [
+            "addrswap_1_3_0",
+            "addrswap_1_3_1",
+            "addrswap_1_3_2",
+            "addrswap_1_3_10",
+            "addrswap_1_4_5",
+            "addrswap_1_4_6",
+            "addrswap_1_4_7",
+            "addrswap_1_4_11",
+            "addrswap_1_3_4",
+            "addrdup_1_3from0",
+            "addrdup_1_3from1",
+            "addrdup_1_3from2",
+            "addrdup_1_3from10",
+            "addrdup_1_4from5",
+            "addrdup_1_4from6",
+            "addrdup_1_4from7",
+            "addrdup_1_4from11",
+            "addrdup_1_3from0_4from5",
+            "addrdup_1_3from10_4from11",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_pair_mixed":
         max_dst = min(5, len(symbols) - 1)
         subset = symbols[:max_dst + 1]
