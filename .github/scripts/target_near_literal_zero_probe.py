@@ -337,9 +337,9 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         return 44
 
     s0, s1, s2 = symbols[:3]
-    names_by_ordinal = {"0": s0, "1": s1, "2": s2}
-    single_match = re.fullmatch(r"single_([012])_to_([012])_(\d+)", mode)
-    set_match = re.fullmatch(r"(set|except)_([012])_to_([012])_([0-9_]+)", mode)
+    names_by_ordinal = {str(i): name for i, name in enumerate(symbols)}
+    single_match = re.fullmatch(r"single_([0-9]+)_to_([0-9]+)_(\d+)", mode)
+    set_match = re.fullmatch(r"(set|except)_([0-9]+)_to_([0-9]+)_([0-9_]+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -358,11 +358,19 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     ordinal_set = None
     ordinal_set_kind = None
     if single_match:
+        if single_match.group(1) not in names_by_ordinal or single_match.group(2) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
         src_name = names_by_ordinal[single_match.group(1)]
         dst_name = names_by_ordinal[single_match.group(2)]
         scope = "single"
         single_ordinal = int(single_match.group(3))
     elif set_match:
+        if set_match.group(2) not in names_by_ordinal or set_match.group(3) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
         ordinal_set_kind = set_match.group(1)
         src_name = names_by_ordinal[set_match.group(2)]
         dst_name = names_by_ordinal[set_match.group(3)]
@@ -695,7 +703,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -894,8 +902,15 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_pair_sweep":
+        max_dst = min(15, len(symbols) - 1)
+        subset = symbols[:max_dst + 1]
+        return [
+            (f"{prefix}cpi01_reloc_set_1_to_{dst}_3_4", subset, f"set_1_to_{dst}_3_4")
+            for dst in range(max_dst + 1)
+        ]
     if mode == "cpi01_reloc_pairs":
         ordinal_modes = [
             "set_1_to_0_3_4",
