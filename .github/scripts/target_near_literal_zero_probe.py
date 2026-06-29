@@ -151,6 +151,115 @@ def rename_symbols_same_length(src, dst, mapping, log_path):
     return 0
 
 
+def nlist_symbols_by_name(data, names):
+    symoff, nsyms, stroff, strsize = macho_symtab(data)
+    wanted = set(names)
+    out = {}
+    for i in range(nsyms):
+        entry_off = symoff + i * 16
+        if entry_off + 16 > len(data):
+            raise ValueError(f"truncated nlist at index {i}")
+        n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", data, entry_off)
+        if n_strx == 0:
+            continue
+        name_off = stroff + n_strx
+        if name_off < stroff or name_off >= stroff + strsize or name_off >= len(data):
+            continue
+        end = data.find(b"\0", name_off, min(stroff + strsize, len(data)))
+        if end < 0:
+            continue
+        name = data[name_off:end].decode("ascii", "replace")
+        if name in wanted:
+            out[name] = {
+                "index": i,
+                "entry_off": entry_off,
+                "entry": bytes(data[entry_off:entry_off + 16]),
+                "strx": n_strx,
+                "type": n_type,
+                "sect": n_sect,
+                "desc": n_desc,
+                "value": n_value,
+            }
+    return out
+
+
+def transform_cpi_nlists(src, dst, symbols, mode, log_path):
+    data = bytearray(Path(src).read_bytes())
+    found = nlist_symbols_by_name(data, symbols)
+    missing = sorted(set(symbols) - set(found))
+    lines = []
+    if missing:
+        lines.append("missing symbols: " + " ".join(missing))
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 44
+    s0, s1, s2 = symbols[:3]
+
+    def describe(name):
+        info = found[name]
+        return (
+            f"{name}: index={info['index']} type=0x{info['type']:02x} "
+            f"sect={info['sect']} desc=0x{info['desc']:04x} "
+            f"value=0x{info['value']:x} strx={info['strx']}"
+        )
+
+    for name in symbols:
+        lines.append("old " + describe(name))
+
+    def set_value(name, value):
+        info = found[name]
+        struct.pack_into("<Q", data, info["entry_off"] + 8, value)
+        lines.append(f"set_value {name}: 0x{info['value']:x} -> 0x{value:x}")
+
+    def set_entry(dst_name, src_name):
+        data[found[dst_name]["entry_off"]:found[dst_name]["entry_off"] + 16] = found[src_name]["entry"]
+        lines.append(f"set_entry {dst_name} <- {src_name}")
+
+    if mode == "swap_values_01":
+        set_value(s0, found[s1]["value"])
+        set_value(s1, found[s0]["value"])
+    elif mode == "equal_value0_01":
+        set_value(s1, found[s0]["value"])
+    elif mode == "equal_value1_01":
+        set_value(s0, found[s1]["value"])
+    elif mode == "equal_value1_12":
+        set_value(s2, found[s1]["value"])
+    elif mode == "swap_entries_01":
+        e0 = found[s0]["entry"]
+        e1 = found[s1]["entry"]
+        data[found[s0]["entry_off"]:found[s0]["entry_off"] + 16] = e1
+        data[found[s1]["entry_off"]:found[s1]["entry_off"] + 16] = e0
+        lines.append(f"swap_entries {s0} <-> {s1}")
+    elif mode == "duplicate_entry0_01":
+        set_entry(s1, s0)
+    elif mode == "duplicate_entry1_01":
+        set_entry(s0, s1)
+    elif mode == "swap_entries_12":
+        e1 = found[s1]["entry"]
+        e2 = found[s2]["entry"]
+        data[found[s1]["entry_off"]:found[s1]["entry_off"] + 16] = e2
+        data[found[s2]["entry_off"]:found[s2]["entry_off"] + 16] = e1
+        lines.append(f"swap_entries {s1} <-> {s2}")
+    else:
+        lines.append(f"unknown nlist transform mode: {mode}")
+        Path(log_path).write_text("\n".join(lines) + "\n")
+        return 2
+
+    updated = nlist_symbols_by_name(data, symbols)
+    for name in symbols:
+        if name in updated:
+            info = updated[name]
+            lines.append(
+                f"new {name}: index={info['index']} type=0x{info['type']:02x} "
+                f"sect={info['sect']} desc=0x{info['desc']:04x} "
+                f"value=0x{info['value']:x} strx={info['strx']}"
+            )
+        else:
+            lines.append(f"new {name}: not found by name")
+    Path(dst).write_bytes(data)
+    Path(log_path).write_text("\n".join(lines) + "\n")
+    return 0
+
+
 def zero_symbols(src, dst, symbols, size, log_path):
     data = bytearray(Path(src).read_bytes())
     sections = macho_sections(data)
@@ -380,7 +489,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -560,6 +669,22 @@ def cpi_symbol_name_transforms(prefix, symbols, mode):
         ("cpi12_equal_name1", {s2: s1}),
     ]
     return [(f"{prefix}{label}", mapping) for label, mapping in transforms]
+
+
+def cpi_nlist_transforms(prefix, symbols, mode):
+    if mode != "cpi01_nlists" or len(symbols) < 3:
+        return []
+    modes = [
+        "swap_values_01",
+        "equal_value0_01",
+        "equal_value1_01",
+        "equal_value1_12",
+        "swap_entries_01",
+        "duplicate_entry0_01",
+        "duplicate_entry1_01",
+        "swap_entries_12",
+    ]
+    return [(f"{prefix}cpi01_nlist_{m}", symbols[:3], m) for m in modes]
 
 
 def add_hex(a, b):
@@ -812,6 +937,11 @@ def main():
             dst = obj_dir / f"{subset_label}.o"
             log = obj_dir / f"{subset_label}.log"
             status = rename_symbols_same_length(selected, dst, mapping, log)
+            variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
+        for subset_label, subset_symbols, mode in cpi_nlist_transforms(cfg["cpi_prefix"], cpi_symbols, cfg["cpi_subset_mode"]):
+            dst = obj_dir / f"{subset_label}.o"
+            log = obj_dir / f"{subset_label}.log"
+            status = transform_cpi_nlists(selected, dst, subset_symbols, mode, log)
             variants.append((subset_label, dst, status, log.read_text(errors="replace").strip()))
 
     print(f"prepared variants={len(variants)} mode={cfg['cpi_subset_mode']}", flush=True)
