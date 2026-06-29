@@ -856,7 +856,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1055,8 +1055,20 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr_window":
+        modes = [
+            "addrswap_1_4_7",
+            "addrswap_1_4_8",
+            "addrswap_1_4_9",
+            "addrswap_1_4_11",
+            "addrdup_1_4from7",
+            "addrdup_1_4from8",
+            "addrdup_1_4from9",
+            "addrdup_1_4from11",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_addr":
         modes = [
             "addrswap_1_3_0",
