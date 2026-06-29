@@ -340,6 +340,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     names_by_ordinal = {str(i): name for i, name in enumerate(symbols)}
     single_match = re.fullmatch(r"single_([0-9]+)_to_([0-9]+)_(\d+)", mode)
     set_match = re.fullmatch(r"(set|except)_([0-9]+)_to_([0-9]+)_([0-9_]+)", mode)
+    map_match = re.fullmatch(r"map_([0-9]+)_((?:[0-9]+to[0-9]+)(?:_[0-9]+to[0-9]+)*)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -357,6 +358,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     single_ordinal = None
     ordinal_set = None
     ordinal_set_kind = None
+    ordinal_dst_indexes = {}
+    ordinal_dst_names = {}
     if single_match:
         if single_match.group(1) not in names_by_ordinal or single_match.group(2) not in names_by_ordinal:
             lines.append(f"unknown CPI ordinal in mode: {mode}")
@@ -376,6 +379,23 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         dst_name = names_by_ordinal[set_match.group(3)]
         scope = "ordinal_set"
         ordinal_set = {int(part) for part in set_match.group(4).split("_") if part}
+    elif map_match:
+        if map_match.group(1) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        src_name = names_by_ordinal[map_match.group(1)]
+        dst_name = src_name
+        scope = "ordinal_map"
+        for part in map_match.group(2).split("_"):
+            source_text, dest_text = part.split("to", 1)
+            if dest_text not in names_by_ordinal:
+                lines.append(f"unknown CPI destination ordinal in mode: {mode}")
+                Path(log_path).write_text("\n".join(lines) + "\n")
+                return 2
+            source_ordinal = int(source_text)
+            dest_name = names_by_ordinal[dest_text]
+            ordinal_dst_names[source_ordinal] = dest_name
     elif mode in rules:
         src_name, dst_name, scope = rules[mode]
     else:
@@ -384,6 +404,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         return 2
     src_index = found[src_name]["index"]
     dst_index = found[dst_name]["index"]
+    for source_ordinal, dest_name in ordinal_dst_names.items():
+        ordinal_dst_indexes[source_ordinal] = found[dest_name]["index"]
 
     symbol_addr = object_symbol_addr(src, target_hash)
     target_addr = None
@@ -406,6 +428,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
             return True
         if scope == "ordinal_set":
             return True
+        if scope == "ordinal_map":
+            return True
         return False
 
     lines.append(f"mode={mode} src={src_name}[{src_index}] dst={dst_name}[{dst_index}] scope={scope}")
@@ -414,6 +438,12 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     if ordinal_set is not None:
         ordinal_text = ",".join(str(i) for i in sorted(ordinal_set))
         lines.append(f"ordinal_set_kind={ordinal_set_kind} ordinal_set={ordinal_text}")
+    if ordinal_dst_names:
+        mapping_text = ", ".join(
+            f"{source}->{dest}[{found[dest]['index']}]"
+            for source, dest in sorted(ordinal_dst_names.items())
+        )
+        lines.append(f"ordinal_dst_map={mapping_text}")
     lines.append(
         f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
         f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
@@ -430,6 +460,11 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         f"dst_symbol {dst_name}: index={found[dst_name]['index']} "
         f"value=0x{found[dst_name]['value']:x}"
     )
+    for source, dest_name in sorted(ordinal_dst_names.items()):
+        lines.append(
+            f"map_dst_symbol source_ordinal={source} {dest_name}: "
+            f"index={found[dest_name]['index']} value=0x{found[dest_name]['value']:x}"
+        )
     for name in symbols[:3]:
         info = found[name]
         lines.append(f"symbol {name}: index={info['index']} value=0x{info['value']:x}")
@@ -459,11 +494,18 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
                 continue
             if ordinal_set_kind == "except" and in_set:
                 continue
+        current_dst_index = dst_index
+        current_dst_name = dst_name
+        if ordinal_dst_indexes:
+            if source_ordinal not in ordinal_dst_indexes:
+                continue
+            current_dst_index = ordinal_dst_indexes[source_ordinal]
+            current_dst_name = ordinal_dst_names[source_ordinal]
         rel_addr = text["addr"] + r_address_u
         if not in_scope(rel_addr):
             continue
         candidates += 1
-        new_word = (r_word & 0xff000000) | dst_index
+        new_word = (r_word & 0xff000000) | current_dst_index
         struct.pack_into("<I", data, rel_off + 4, new_word)
         changed += 1
         if changed <= 80:
@@ -472,7 +514,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
                 f"retarget rel[{i}] section_off=0x{r_address_u:x} addr=0x{rel_addr:x} "
                 f"source_ordinal={source_ordinal} delta_to_target={delta_text} "
                 f"type={bits['type']} len={bits['length']} "
-                f"pcrel={bits['pcrel']} word=0x{r_word:08x}->0x{new_word:08x}"
+                f"pcrel={bits['pcrel']} dst={current_dst_name}[{current_dst_index}] "
+                f"word=0x{r_word:08x}->0x{new_word:08x}"
             )
     lines.append(f"changed={changed} candidates={candidates} source_seen={source_seen}")
     if changed == 0:
@@ -711,7 +754,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -910,8 +953,17 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_pair_mixed":
+        max_dst = min(5, len(symbols) - 1)
+        subset = symbols[:max_dst + 1]
+        out = []
+        for dst3 in range(max_dst + 1):
+            for dst4 in range(max_dst + 1):
+                mode_name = f"map_1_3to{dst3}_4to{dst4}"
+                out.append((f"{prefix}cpi01_reloc_{mode_name}", subset, mode_name))
+        return out
     if mode == "cpi01_reloc_pair_sweep":
         max_dst = min(15, len(symbols) - 1)
         subset = symbols[:max_dst + 1]
