@@ -343,6 +343,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     map_match = re.fullmatch(r"map_([0-9]+)_((?:[0-9]+to[0-9]+)(?:_[0-9]+to[0-9]+)*)", mode)
     addrdup_match = re.fullmatch(r"addrdup_([0-9]+)_((?:[0-9]+from[0-9]+)(?:_[0-9]+from[0-9]+)*)", mode)
     addrswap_match = re.fullmatch(r"addrswap_([0-9]+)_([0-9]+)_([0-9]+)", mode)
+    addrdupany_match = re.fullmatch(r"addrdupany_([0-9]+)_([0-9]+)_ge([0-9a-fA-F]+)", mode)
     rules = {
         "all_1_to_0": (s1, s0, "all"),
         "all_0_to_1": (s0, s1, "all"),
@@ -364,6 +365,7 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
     ordinal_dst_names = {}
     address_dup_map = {}
     address_swap_pair = None
+    address_dup_any = None
     if single_match:
         if single_match.group(1) not in names_by_ordinal or single_match.group(2) not in names_by_ordinal:
             lines.append(f"unknown CPI ordinal in mode: {mode}")
@@ -420,6 +422,18 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         dst_name = src_name
         scope = "address_edit"
         address_swap_pair = (int(addrswap_match.group(2)), int(addrswap_match.group(3)))
+    elif addrdupany_match:
+        if addrdupany_match.group(1) not in names_by_ordinal:
+            lines.append(f"unknown CPI ordinal in mode: {mode}")
+            Path(log_path).write_text("\n".join(lines) + "\n")
+            return 2
+        src_name = names_by_ordinal[addrdupany_match.group(1)]
+        dst_name = src_name
+        scope = "address_edit"
+        address_dup_any = {
+            "target_ordinal": int(addrdupany_match.group(2)),
+            "min_delta": int(addrdupany_match.group(3), 16),
+        }
     elif mode in rules:
         src_name, dst_name, scope = rules[mode]
     else:
@@ -475,6 +489,11 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         lines.append(f"address_dup_map={dup_text}")
     if address_swap_pair is not None:
         lines.append(f"address_swap_pair={address_swap_pair[0]}<->{address_swap_pair[1]}")
+    if address_dup_any is not None:
+        lines.append(
+            f"address_dup_any target_ordinal={address_dup_any['target_ordinal']} "
+            f"min_delta=0x{address_dup_any['min_delta']:x}"
+        )
     lines.append(
         f"text addr=0x{text['addr']:x} size=0x{text['size']:x} "
         f"reloff=0x{text['reloff']:x} nreloc={text['nreloc']}"
@@ -526,6 +545,8 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
         needed = set(address_dup_map) | set(address_dup_map.values())
         if address_swap_pair is not None:
             needed.update(address_swap_pair)
+        if address_dup_any is not None:
+            needed.add(address_dup_any["target_ordinal"])
         missing_ordinals = sorted(i for i in needed if i < 0 or i >= len(source_entries))
         if missing_ordinals:
             lines.append("missing source ordinals: " + " ".join(str(i) for i in missing_ordinals))
@@ -555,6 +576,63 @@ def transform_cpi_text_relocs(src, dst, symbols, mode, target_hash, target_offse
                 f"0x{target_entry['address']:x}->0x{source_entry['address']:x} "
                 f"from ordinal={source_ordinal} rel[{source_entry['rel_index']}]"
             )
+        if address_dup_any is not None:
+            if target_addr is None:
+                lines.append("addrdupany requires target_addr")
+                Path(log_path).write_text("\n".join(lines) + "\n")
+                return 44
+            target_ordinal = address_dup_any["target_ordinal"]
+            min_delta = address_dup_any["min_delta"]
+            target_entry = source_entries[target_ordinal]
+            target_bits = target_entry["bits"]
+            candidates = []
+            for i in range(text["nreloc"]):
+                rel_off = text["reloff"] + i * 8
+                if rel_off + 8 > len(data):
+                    lines.append(f"truncated relocation entry {i} at 0x{rel_off:x}")
+                    Path(log_path).write_text("\n".join(lines) + "\n")
+                    return 2
+                r_address_u, r_word = struct.unpack_from("<II", data, rel_off)
+                if r_address_u & 0x80000000:
+                    continue
+                bits = relocation_kind(r_word)
+                if not bits["extern"]:
+                    continue
+                if bits["type"] != target_bits["type"]:
+                    continue
+                if bits["pcrel"] != target_bits["pcrel"] or bits["length"] != target_bits["length"]:
+                    continue
+                rel_addr = text["addr"] + r_address_u
+                delta = target_addr - rel_addr
+                if delta <= 0 or delta < min_delta:
+                    continue
+                candidates.append((delta, i, rel_off, r_address_u, r_word, bits))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            if not candidates:
+                lines.append(
+                    f"addrdupany no candidates for target_ordinal={target_ordinal} "
+                    f"min_delta=0x{min_delta:x}"
+                )
+                Path(log_path).write_text("\n".join(lines) + "\n")
+                return 44
+            delta, rel_index, rel_off, source_address, source_word, source_bits = candidates[0]
+            struct.pack_into("<I", data, target_entry["rel_off"], source_address)
+            changed += 1
+            lines.append(
+                f"dup_any_address ordinal={target_ordinal} rel[{target_entry['rel_index']}] "
+                f"0x{target_entry['address']:x}->0x{source_address:x} "
+                f"from rel[{rel_index}] delta_to_target=0x{delta:x} "
+                f"symbolnum={source_bits['symbolnum']} type={source_bits['type']} "
+                f"pcrel={source_bits['pcrel']} len={source_bits['length']} "
+                f"word=0x{source_word:08x}"
+            )
+            for cand_delta, cand_index, _, cand_address, cand_word, cand_bits in candidates[:12]:
+                lines.append(
+                    f"dup_any_candidate rel[{cand_index}] section_off=0x{cand_address:x} "
+                    f"delta_to_target=0x{cand_delta:x} symbolnum={cand_bits['symbolnum']} "
+                    f"type={cand_bits['type']} pcrel={cand_bits['pcrel']} "
+                    f"len={cand_bits['length']} word=0x{cand_word:08x}"
+                )
         for entry in source_entries:
             if entry["ordinal"] <= 12:
                 rel_addr = text["addr"] + entry["address"]
@@ -856,7 +934,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1055,8 +1133,23 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_addr_any_window":
+        modes = [
+            "addrdupany_1_4_ge0028",
+            "addrdupany_1_4_ge0210",
+            "addrdupany_1_4_ge0400",
+            "addrdupany_1_4_ge0600",
+            "addrdupany_1_4_ge0800",
+            "addrdupany_1_4_ge0c00",
+            "addrdupany_1_4_ge1000",
+            "addrdupany_1_4_ge1400",
+            "addrdupany_1_4_ge1800",
+            "addrdupany_1_4_ge1c00",
+            "addrdupany_1_4_ge2034",
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_addr_window":
         modes = [
             "addrswap_1_4_7",
