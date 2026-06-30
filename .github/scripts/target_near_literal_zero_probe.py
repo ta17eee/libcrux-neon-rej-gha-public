@@ -1404,7 +1404,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1603,7 +1603,7 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes") or len(symbols) < 3:
         return []
     if mode == "cpi01_reloc_pair_value_grid_symbols":
         modes = []
@@ -1620,6 +1620,12 @@ def cpi_reloc_transforms(prefix, symbols, mode):
         modes = [
             f"mapdelta_1_3to1_4to1_d1p{bucket * 0x10:04x}"
             for bucket in range(25, 49)
+        ]
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
+    if mode == "cpi01_reloc_pair_value_grid_hi2":
+        modes = [
+            f"mapdelta_1_3to1_4to1_d1p{bucket * 0x10:04x}"
+            for bucket in range(49, 97)
         ]
         return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_pair_value_grid":
