@@ -1482,7 +1482,7 @@ def cpi_subsets(prefix, symbols, mode):
     if not symbols:
         return []
     n = len(symbols)
-    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_neg", "cpi01_reloc_pair_value_grid_neg2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_adrp_value", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes", "cpi01_reloc_addr_patch_pair_opcode_value", "cpi01_reloc_addr_patch_pair_imm_value", "cpi01_reloc_addr_patch_pair_rt_value", "cpi01_reloc_addr_patch_pair_adrp_imm_value", "cpi01_reloc_addr_patch_pair_reg_value", "cpi01_reloc_addr_patch_pair_after_value", "cpi01_reloc_target_word_rd_value", "cpi01_reloc_target_word_payload_value", "cpi01_reloc_target_word_opcode_value"):
+    if mode in ("cpi01_words", "cpi01_asym", "cpi01_omit", "cpi01_byte_omit", "cpi01_permute", "cpi012_equal_pairs", "cpi01_symbol_names", "cpi01_nlists", "cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_neg", "cpi01_reloc_pair_value_grid_neg2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_adrp_value", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes", "cpi01_reloc_addr_patch_pair_opcode_value", "cpi01_reloc_addr_patch_pair_imm_value", "cpi01_reloc_addr_patch_pair_rt_value", "cpi01_reloc_addr_patch_pair_adrp_imm_value", "cpi01_reloc_addr_patch_pair_reg_value", "cpi01_reloc_addr_patch_pair_after_value", "cpi01_reloc_target_word_rd_value", "cpi01_reloc_target_word_payload_value", "cpi01_reloc_target_word_opcode_value", "cpi01_reloc_target_word_bit21_value"):
         return []
     if mode == "q1_detail":
         q1_hi = (n + 3) // 4
@@ -1681,8 +1681,35 @@ def cpi_nlist_transforms(prefix, symbols, mode):
 
 
 def cpi_reloc_transforms(prefix, symbols, mode):
-    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_neg", "cpi01_reloc_pair_value_grid_neg2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_adrp_value", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes", "cpi01_reloc_addr_patch_pair_opcode_value", "cpi01_reloc_addr_patch_pair_imm_value", "cpi01_reloc_addr_patch_pair_rt_value", "cpi01_reloc_addr_patch_pair_adrp_imm_value", "cpi01_reloc_addr_patch_pair_reg_value", "cpi01_reloc_addr_patch_pair_after_value", "cpi01_reloc_target_word_rd_value", "cpi01_reloc_target_word_payload_value", "cpi01_reloc_target_word_opcode_value") or len(symbols) < 3:
+    if mode not in ("cpi01_relocs", "cpi01_reloc_singles", "cpi01_reloc_pairs", "cpi01_reloc_pair_sweep", "cpi01_reloc_pair_mixed", "cpi01_reloc_pair_value", "cpi01_reloc_pair_name", "cpi01_reloc_pair_entry", "cpi01_reloc_pair_diag_meta", "cpi01_reloc_pair_value_delta", "cpi01_reloc_pair_value_grid", "cpi01_reloc_pair_value_grid_hi", "cpi01_reloc_pair_value_grid_hi2", "cpi01_reloc_pair_value_grid_neg", "cpi01_reloc_pair_value_grid_neg2", "cpi01_reloc_pair_value_grid_symbols", "cpi01_reloc_addr", "cpi01_reloc_addr_window", "cpi01_reloc_addr_any_window", "cpi01_reloc_addr_opcode_window", "cpi01_reloc_addr_patch_adrp_window", "cpi01_reloc_addr_patch_adrp_fine", "cpi01_reloc_addr_patch_adrp_value", "cpi01_reloc_addr_patch_after_window", "cpi01_reloc_addr_patch_after_fine", "cpi01_reloc_addr_patch_after_exact", "cpi01_reloc_addr_patch_after_ldr_regs", "cpi01_reloc_addr_patch_pair_regs", "cpi01_reloc_addr_patch_pair_opcodes", "cpi01_reloc_addr_patch_pair_opcode_value", "cpi01_reloc_addr_patch_pair_imm_value", "cpi01_reloc_addr_patch_pair_rt_value", "cpi01_reloc_addr_patch_pair_adrp_imm_value", "cpi01_reloc_addr_patch_pair_reg_value", "cpi01_reloc_addr_patch_pair_after_value", "cpi01_reloc_target_word_rd_value", "cpi01_reloc_target_word_payload_value", "cpi01_reloc_target_word_opcode_value", "cpi01_reloc_target_word_bit21_value") or len(symbols) < 3:
         return []
+    if mode == "cpi01_reloc_target_word_bit21_value":
+        target_words = [
+            "aa0303fc",  # ORR, bit21=0
+            "aa2303fc",  # ORR-family, bit21=1
+            "8a0303fc",  # AND, bit21=0
+            "8a2303fc",  # AND-family, bit21=1
+            "d503201f",  # NOP, bit21=0
+            "d523201f",  # NOP-like, bit21=1
+            "d65f03c0",  # RET, bit21=0
+            "d67f03c0",  # RET-like, bit21=1
+        ]
+        bucket_deltas = [
+            None,
+            "d1m0800",
+            "d1m0200",
+            "d1p0040",
+            "d1p01d0",
+            "d1p0220",
+            "d1p0400",
+            "d1p0590",
+        ]
+        modes = []
+        for target_word in target_words:
+            base = f"targetword_1_w{target_word}"
+            for delta in bucket_deltas:
+                modes.append(base if delta is None else f"{base}_{delta}")
+        return [(f"{prefix}cpi01_reloc_{m}", symbols[:3], m) for m in modes]
     if mode == "cpi01_reloc_target_word_opcode_value":
         target_words = [
             "8a0303fc",  # AND x28, xzr, x3
