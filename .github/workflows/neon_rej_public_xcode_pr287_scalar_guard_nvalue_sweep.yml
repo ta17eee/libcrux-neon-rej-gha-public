@@ -9,6 +9,7 @@ on:
       - .github/workflows/neon_rej_public_xcode_pr287_scalar_guard_nvalue_sweep.yml
       - .github/scripts/retarget_macho_relocs.py
       - .github/scripts/patch_macho_symbol_values.py
+      - .github/scripts/dump_pr287_reloc_context.py
       - .github/scripts/scan_pr287_bad_word.py
       - .github/scripts/summarize_pr287_nvalue_sweep.py
       - .github/scripts/patch_pr287_rejsample_scalar_guard.py
@@ -136,6 +137,27 @@ jobs:
             echo "compiler_builtins=${compiler_builtins}"
           } | tee "${diag}/selected-object.log"
 
+          python3 ../harness/.github/scripts/dump_pr287_reloc_context.py \
+            --object "${selected_obj}" \
+            --scan-json "${diag}/cargo-final-scan.json" \
+            --out-json "${diag}/reloc-context.json" \
+            --out-md "${diag}/reloc-context.md"
+
+          pair_info="$(
+            python3 -c 'import json; d=json.load(open("'"${diag}/reloc-context.json"'")); pairs=[p for p in d["candidate_page21_pageoff_pairs"] if p["symbol"]=="lCPI233_2" and p["matched_base_reg"]]; pairs.sort(key=lambda p: (abs(p["page21_delta"])+abs(p["pageoff_delta"]), abs(p["pageoff_delta"]))); p=pairs[0]; print(f"{p[\"page21_index\"]} {p[\"pageoff_index\"]} {p[\"symbol\"]} {p[\"symbol_value\"]}")'
+          )"
+          set -- ${pair_info}
+          pair_page21_index="$1"
+          pair_pageoff_index="$2"
+          pair_symbol="$3"
+          pair_symbol_value="$4"
+          {
+            echo "pair_page21_index=${pair_page21_index}"
+            echo "pair_pageoff_index=${pair_pageoff_index}"
+            echo "pair_symbol=${pair_symbol}"
+            echo "pair_symbol_value=${pair_symbol_value}"
+          } | tee "${diag}/selected-pair.log"
+
           value_of_symbol() {
             awk -v sym="$1" '$NF == sym { print "0x"$1; found=1; exit } END { if (!found) exit 1 }' "${diag}/lcpi233-symbols.txt"
           }
@@ -162,8 +184,8 @@ jobs:
               --input "${selected_obj}" \
               --output "${out_dir}/retargeted.o" \
               --out-json "${out_dir}/retarget.json" \
-              --map 14471="${target_symbol}" \
-              --map 14470="${target_symbol}" \
+              --map "${pair_page21_index}=${target_symbol}" \
+              --map "${pair_pageoff_index}=${target_symbol}" \
               2>&1 | tee "${out_dir}/retarget.log"
             if [ -n "${patch_value}" ]; then
               python3 ../harness/.github/scripts/patch_macho_symbol_values.py \
