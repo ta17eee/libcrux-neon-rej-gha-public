@@ -144,7 +144,7 @@ jobs:
             --out-md "${diag}/reloc-context.md"
 
           pair_info="$(
-            python3 -c 'import json; d=json.load(open("'"${diag}/reloc-context.json"'")); pairs=[p for p in d["candidate_page21_pageoff_pairs"] if p["symbol"]=="lCPI233_2" and p["matched_base_reg"]]; pairs.sort(key=lambda p: (abs(p["page21_delta"])+abs(p["pageoff_delta"]), abs(p["pageoff_delta"]))); p=pairs[0]; print(f"{p[\"page21_index\"]} {p[\"pageoff_index\"]} {p[\"symbol\"]} {p[\"symbol_value\"]}")'
+            python3 -c 'import json; d=json.load(open("'"${diag}/reloc-context.json"'")); pairs=[p for p in d["candidate_page21_pageoff_pairs"] if p["symbol"]=="lCPI233_2" and p["matched_base_reg"]]; pairs.sort(key=lambda p: (abs(p["page21_delta"])+abs(p["pageoff_delta"]), abs(p["pageoff_delta"]))); p=pairs[0]; print("{} {} {} {}".format(p["page21_index"], p["pageoff_index"], p["symbol"], p["symbol_value"]))'
           )"
           set -- ${pair_info}
           pair_page21_index="$1"
