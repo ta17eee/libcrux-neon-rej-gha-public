@@ -1,7 +1,12 @@
 name: NEON rejection sampler public Xcode PR287 re-enable instrumented KAT
 
-"on":
+on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/neon_rej_public_xcode_pr287_reenable_instrumented_kat.yml
 
 env:
   CARGO_HTTP_MULTIPLEXING: "false"
