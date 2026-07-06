@@ -107,8 +107,10 @@ jobs:
           RUST_BACKTRACE: "1"
         run: |
           set -o pipefail
-          bin="$(find target/release/deps -maxdepth 1 -type f -perm +111 -name 'nistkats-*' | head -n 1)"
+          bin="$(pwd)/$(find target/release/deps -maxdepth 1 -type f -perm +111 -name 'nistkats-*' | head -n 1)"
+          test -x "${bin}"
           echo "binary=${bin}" | tee neon-rej-diagnostics/pr287-scalar-guard-lldb/lldb.log
+          echo "process_cwd=$(pwd)/libcrux-ml-kem" | tee -a neon-rej-diagnostics/pr287-scalar-guard-lldb/lldb.log
           {
             echo "### otool -l"
             otool -l "${bin}" || true
@@ -117,6 +119,7 @@ jobs:
             echo "### lldb"
             lldb --batch \
               -o "settings set target.process.thread.step-avoid-regexp ^$" \
+              -o "settings set target.process.cwd $(pwd)/libcrux-ml-kem" \
               -o "run --nocapture" \
               -o "thread list" \
               -o "thread backtrace all" \
