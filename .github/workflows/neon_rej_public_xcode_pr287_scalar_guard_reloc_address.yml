@@ -242,69 +242,69 @@ jobs:
             relink_variant "$(basename "${variant_dir}")"
           done
 
-          python3 - <<'PY' "${diag}/variants" "${diag}/address-sweep-summary.json" "${diag}/address-sweep-summary.md"
-import json
-import sys
-from pathlib import Path
+          python3 - "${diag}/variants" "${diag}/address-sweep-summary.json" "${diag}/address-sweep-summary.md" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
 
-variants = Path(sys.argv[1])
-out_json = Path(sys.argv[2])
-out_md = Path(sys.argv[3])
+          variants = Path(sys.argv[1])
+          out_json = Path(sys.argv[2])
+          out_md = Path(sys.argv[3])
 
-def load(path, default):
-    return json.loads(path.read_text()) if path.exists() else default
+          def load(path, default):
+              return json.loads(path.read_text()) if path.exists() else default
 
-def first_executable(scan):
-    entries = [
-        e for e in scan.get("interesting_files", [])
-        if "Mach-O 64-bit executable" in e.get("kind", "")
-    ]
-    return sorted(entries, key=lambda e: len(e.get("path", "")))[0] if entries else None
+          def first_executable(scan):
+              entries = [
+                  e for e in scan.get("interesting_files", [])
+                  if "Mach-O 64-bit executable" in e.get("kind", "")
+              ]
+              return sorted(entries, key=lambda e: len(e.get("path", "")))[0] if entries else None
 
-rows = []
-for variant in sorted(p for p in variants.iterdir() if p.is_dir()):
-    patch = load(variant / "address-patch.json", {"changes": []})
-    scan = load(variant / "scan.json", {"interesting_files": []})
-    entry = first_executable(scan)
-    matches = entry.get("wildcard_context_matches", []) if entry else []
-    word = matches[0]["wildcard_word"] if matches else None
-    meta = ""
-    meta_path = variant / "meta.log"
-    if meta_path.exists():
-        for line in meta_path.read_text(errors="replace").splitlines():
-            if line.startswith("manual_link_status="):
-                meta = line.split("=", 1)[1]
-    changes = patch.get("changes", [])
-    rows.append({
-        "variant": variant.name,
-        "changes": changes,
-        "final_context_word": word,
-        "payload_bits_21_10": None if word is None else f"0x{((int(word,16) >> 10) & 0xfff):03x}",
-        "exact_bad_word_count": None if entry is None else entry.get("exact_bad_word_count"),
-        "wildcard_context_match_count": None if entry is None else entry.get("wildcard_context_match_count"),
-        "manual_link_status": meta,
-    })
+          rows = []
+          for variant in sorted(p for p in variants.iterdir() if p.is_dir()):
+              patch = load(variant / "address-patch.json", {"changes": []})
+              scan = load(variant / "scan.json", {"interesting_files": []})
+              entry = first_executable(scan)
+              matches = entry.get("wildcard_context_matches", []) if entry else []
+              word = matches[0]["wildcard_word"] if matches else None
+              meta = ""
+              meta_path = variant / "meta.log"
+              if meta_path.exists():
+                  for line in meta_path.read_text(errors="replace").splitlines():
+                      if line.startswith("manual_link_status="):
+                          meta = line.split("=", 1)[1]
+              changes = patch.get("changes", [])
+              rows.append({
+                  "variant": variant.name,
+                  "changes": changes,
+                  "final_context_word": word,
+                  "payload_bits_21_10": None if word is None else f"0x{((int(word,16) >> 10) & 0xfff):03x}",
+                  "exact_bad_word_count": None if entry is None else entry.get("exact_bad_word_count"),
+                  "wildcard_context_match_count": None if entry is None else entry.get("wildcard_context_match_count"),
+                  "manual_link_status": meta,
+              })
 
-out_json.write_text(json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n")
-lines = [
-    "# PR287 relocation address sweep summary",
-    "",
-    "| Variant | Address changes | Final word | bits[21:10] | Exact bad count | Link status |",
-    "| --- | --- | --- | ---: | ---: | ---: |",
-]
-for row in rows:
-    changes = "; ".join(
-        f"rel[{c['relocation_index']}] {c['type_name']} {c['old_address']}->{c['new_address']}"
-        for c in row["changes"]
-    )
-    lines.append(
-        f"| {row['variant']} | `{changes}` | `{row['final_context_word']}` | "
-        f"`{row['payload_bits_21_10']}` | {row['exact_bad_word_count']} | {row['manual_link_status']} |"
-    )
-lines.append("")
-out_md.write_text("\n".join(lines))
-print(out_md.read_text())
-PY
+          out_json.write_text(json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n")
+          lines = [
+              "# PR287 relocation address sweep summary",
+              "",
+              "| Variant | Address changes | Final word | bits[21:10] | Exact bad count | Link status |",
+              "| --- | --- | --- | ---: | ---: | ---: |",
+          ]
+          for row in rows:
+              changes = "; ".join(
+                  f"rel[{c['relocation_index']}] {c['type_name']} {c['old_address']}->{c['new_address']}"
+                  for c in row["changes"]
+              )
+              lines.append(
+                  f"| {row['variant']} | `{changes}` | `{row['final_context_word']}` | "
+                  f"`{row['payload_bits_21_10']}` | {row['exact_bad_word_count']} | {row['manual_link_status']} |"
+              )
+          lines.append("")
+          out_md.write_text("\n".join(lines))
+          print(out_md.read_text())
+          PY
 
           {
             echo "# PR287 relocation address sweep"
