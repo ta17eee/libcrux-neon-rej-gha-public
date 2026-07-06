@@ -26,6 +26,11 @@ jobs:
             target_feature_flags: "-C target_feature=+neon"
 
     steps:
+      - name: Checkout probe repository
+        uses: actions/checkout@v4
+        with:
+          path: harness
+
       - name: Checkout public upstream libcrux at PR287 fallback commit
         uses: actions/checkout@v4
         with:
@@ -68,7 +73,7 @@ jobs:
         run: |
           perl -0pi -e 's#// mod rejsample;#mod rejsample;#' polynomials-aarch64/src/lib.rs
           perl -0pi -e 's#rej_sample\(a, out\)#rejsample::rej_sample(a, out)#' polynomials-aarch64/src/lib.rs
-          python3 ../.github/scripts/patch_pr287_rejsample_debug.py
+          python3 ../harness/.github/scripts/patch_pr287_rejsample_debug.py
           git diff -- polynomials-aarch64/src/lib.rs polynomials-aarch64/src/rejsample.rs
 
       - name: Install historical toolchain
