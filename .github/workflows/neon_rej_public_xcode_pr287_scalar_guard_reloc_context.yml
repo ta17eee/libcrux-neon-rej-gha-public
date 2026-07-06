@@ -156,8 +156,6 @@ jobs:
 
           xcrun llvm-objdump --macho --arch=arm64 --reloc "${selected_obj}" \
             > "${diag}/object/llvm-reloc.txt" 2>&1 || true
-          xcrun llvm-objdump --macho --arch=arm64 --demangle --disassemble "${selected_obj}" \
-            > "${diag}/object/llvm-disassemble.txt" 2>&1 || true
           otool -r "${selected_obj}" > "${diag}/object/otool-reloc.txt" 2>&1 || true
           nm -nm "${selected_obj}" > "${diag}/object/nm.txt" 2>&1 || true
 
