@@ -119,8 +119,7 @@ jobs:
             echo "### lldb"
             lldb --batch \
               -o "settings set target.process.thread.step-avoid-regexp ^$" \
-              -o "settings set target.process.cwd $(pwd)/libcrux-ml-kem" \
-              -o "run --nocapture" \
+              -o "process launch --working-dir $(pwd)/libcrux-ml-kem -- --nocapture" \
               -o "thread list" \
               -o "thread backtrace all" \
               -o "register read" \
