@@ -221,6 +221,12 @@ def find_context_match(scan, object_path):
     raise ValueError("no object wildcard context match in scan JSON")
 
 
+def parse_intish(value):
+    if isinstance(value, int):
+        return value
+    return int(value, 16 if isinstance(value, str) and value.startswith("0x") else 10)
+
+
 def section_for_file_offset(sects, file_off):
     for sec in sects:
         if sec["offset"] <= file_off < sec["offset"] + sec["size"]:
@@ -261,7 +267,7 @@ def main():
     sects = sections(data)
     syms = symbols(data)
     match = find_context_match(scan, args.object)
-    context_file_off = int(match["offset"], 16)
+    context_file_off = parse_intish(match["offset"])
     bad_index = int(scan["bad_index"])
     victim_file_off = context_file_off + bad_index * 4
     sec = section_for_file_offset(sects, victim_file_off)
