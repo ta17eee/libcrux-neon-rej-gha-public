@@ -44,6 +44,27 @@ def parse_lldb_words(path):
     return text, memory_words, bad_word, bad_index
 
 
+def parse_pattern_words(pattern_text, bad_word_text, bad_index_text):
+    words = [int(word, 16) for word in re.findall(r"0x[0-9a-fA-F]+|[0-9a-fA-F]{8}", pattern_text)]
+    if not words:
+        raise SystemExit("--pattern-words did not contain any words")
+    bad_word = int(bad_word_text, 16) if bad_word_text else None
+    if bad_index_text is not None:
+        bad_index = int(bad_index_text, 0)
+        if bad_index < 0 or bad_index >= len(words):
+            raise SystemExit(f"--bad-index {bad_index} outside pattern length {len(words)}")
+        if bad_word is None:
+            bad_word = words[bad_index]
+    elif bad_word is not None:
+        try:
+            bad_index = words.index(bad_word)
+        except ValueError as exc:
+            raise SystemExit(f"--bad-word 0x{bad_word:08x} not present in pattern") from exc
+    else:
+        raise SystemExit("pattern mode requires --bad-word or --bad-index")
+    return "", words, bad_word, bad_index
+
+
 def file_description(path):
     try:
         return subprocess.run(
@@ -92,11 +113,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--bin", required=True, type=Path)
-    parser.add_argument("--lldb-log", required=True, type=Path)
+    parser.add_argument("--lldb-log", type=Path)
+    parser.add_argument("--pattern-words")
+    parser.add_argument("--bad-word")
+    parser.add_argument("--bad-index")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
-    lldb_text, pattern_words, bad_word, bad_index = parse_lldb_words(args.lldb_log)
+    if args.pattern_words:
+        lldb_text, pattern_words, bad_word, bad_index = parse_pattern_words(
+            args.pattern_words,
+            args.bad_word,
+            args.bad_index,
+        )
+    elif args.lldb_log:
+        lldb_text, pattern_words, bad_word, bad_index = parse_lldb_words(args.lldb_log)
+    else:
+        raise SystemExit("either --lldb-log or --pattern-words is required")
     candidates = [p for p in args.root.rglob("*") if p.is_file()]
     # Ensure the final binary is scanned even if it is outside the candidate
     # root or appears through a different path spelling.
@@ -126,7 +159,7 @@ def main():
         "bad_index": bad_index,
         "pattern_words": [f"0x{w:08x}" for w in pattern_words],
         "final_binary": str(args.bin),
-        "lldb_log": str(args.lldb_log),
+        "lldb_log": "" if args.lldb_log is None else str(args.lldb_log),
         "interesting_files": interesting,
     }
 
