@@ -1,0 +1,328 @@
+name: NEON rejection sampler public Xcode PR287 scalar guard relocation address
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/neon_rej_public_xcode_pr287_scalar_guard_reloc_address.yml
+      - .github/scripts/patch_macho_reloc_addresses.py
+      - .github/scripts/dump_pr287_reloc_context.py
+      - .github/scripts/scan_pr287_bad_word.py
+      - .github/scripts/patch_pr287_rejsample_scalar_guard.py
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  pr287-scalar-guard-reloc-address:
+    name: pr287 scalar-guard relocation address
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout probe repository
+        uses: actions/checkout@v4
+        with:
+          path: harness
+
+      - name: Checkout public upstream libcrux at PR287 fallback commit
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 76ab582c79998d5ef77e6e6b6d287c6b1ff0106d
+          path: libcrux
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        working-directory: libcrux
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Re-enable NEON rejection sampler with scalar guard
+        working-directory: libcrux
+        run: |
+          perl -0pi -e 's#// mod rejsample;#mod rejsample;#' polynomials-aarch64/src/lib.rs
+          perl -0pi -e 's#rej_sample\(a, out\)#rejsample::rej_sample(a, out)#' polynomials-aarch64/src/lib.rs
+          python3 ../harness/.github/scripts/patch_pr287_rejsample_scalar_guard.py
+          git diff -- polynomials-aarch64/src/lib.rs polynomials-aarch64/src/rejsample.rs
+
+      - name: Install historical toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build and sweep relocation address variants
+        working-directory: libcrux
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_15.0.1.app/Contents/Developer
+          RUSTFLAGS: -C save-temps -C debuginfo=2
+        run: |
+          set -o pipefail
+          diag="neon-rej-diagnostics/pr287-scalar-guard-reloc-address"
+          pattern_words="0xce162400 0x6e3b1fa2 0xce1b3ba3 0xce0e2842 0xce0a2063 0x6e2b1ea4 0xce0b36a5 0xce0d3c84 0x4e803241 0xce0f40b2 0xce1c1b25 0x4eb11e3c 0x4eb61ed1 0x3dc1efe7 0xce1a1cb8 0xce88fc42"
+          mkdir -p "${diag}/variants"
+          {
+            echo "label=pr287 scalar-guard relocation address"
+            echo "developer_dir=${DEVELOPER_DIR}"
+            sw_vers
+            uname -a
+            xcodebuild -version
+            xcrun --find cc
+            xcrun --find ld
+            xcrun --show-sdk-path
+            ld -v || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+          } | tee "${diag}/toolchain.log"
+
+          cargo +1.78.0 test \
+            --manifest-path libcrux-ml-kem/Cargo.toml \
+            --release \
+            --test nistkats \
+            --no-run \
+            2>&1 | tee "${diag}/build.log"
+
+          bin="$(pwd)/$(find target/release/deps -maxdepth 1 -type f -perm +111 -name 'nistkats-*' | head -n 1)"
+          test -x "${bin}"
+          python3 ../harness/.github/scripts/scan_pr287_bad_word.py \
+            --root target/release/deps \
+            --bin "${bin}" \
+            --pattern-words "${pattern_words}" \
+            --bad-word 0x4e803241 \
+            --bad-index 8 \
+            --out "${diag}/cargo-final-scan.json" \
+            2>&1 | tee "${diag}/cargo-final-scan.log"
+
+          selected_obj="$(
+            python3 -c 'import json; d=json.load(open("'"${diag}/cargo-final-scan.json"'")); print(next(e["path"] for e in d["interesting_files"] if "Mach-O 64-bit object" in e["kind"] and e["wildcard_context_match_count"]))'
+          )"
+          test -f "${selected_obj}"
+          rustlib="$(rustc +1.78.0 --print target-libdir)"
+          compiler_builtins="$(ls "${rustlib}"/libcompiler_builtins-*.rlib | head -n 1)"
+          test -f "${compiler_builtins}"
+          {
+            echo "selected_obj=${selected_obj}"
+            file "${selected_obj}" || true
+            shasum -a 256 "${selected_obj}" || true
+            echo "rustlib=${rustlib}"
+            echo "compiler_builtins=${compiler_builtins}"
+          } | tee "${diag}/selected-object.log"
+
+          python3 ../harness/.github/scripts/dump_pr287_reloc_context.py \
+            --object "${selected_obj}" \
+            --scan-json "${diag}/cargo-final-scan.json" \
+            --out-json "${diag}/reloc-context.json" \
+            --out-md "${diag}/reloc-context.md"
+
+          pair_info="$(
+            python3 -c 'import json,re; d=json.load(open("'"${diag}/reloc-context.json"'")); pairs=[p for p in d["candidate_page21_pageoff_pairs"] if re.fullmatch(r"lCPI[0-9]+_2", p["symbol"]) and p["matched_base_reg"]]; pairs.sort(key=lambda p: (abs(p["page21_delta"])+abs(p["pageoff_delta"]), abs(p["pageoff_delta"]))); p=pairs[0]; print("{} {} {} {} {} {}".format(p["page21_index"], p["pageoff_index"], int(p["page21_addr"],16), int(p["pageoff_addr"],16), int(d["victim_section_addr"],16), p["symbol"]))'
+          )"
+          set -- ${pair_info}
+          pair_page21_index="$1"
+          pair_pageoff_index="$2"
+          pair_page21_addr="$3"
+          pair_pageoff_addr="$4"
+          victim_addr="$5"
+          pair_symbol="$6"
+          {
+            echo "pair_page21_index=${pair_page21_index}"
+            echo "pair_pageoff_index=${pair_pageoff_index}"
+            printf 'pair_page21_addr=0x%x\n' "${pair_page21_addr}"
+            printf 'pair_pageoff_addr=0x%x\n' "${pair_pageoff_addr}"
+            printf 'victim_addr=0x%x\n' "${victim_addr}"
+            echo "pair_symbol=${pair_symbol}"
+          } | tee "${diag}/selected-pair.log"
+
+          make_address_variant() {
+            local label="$1"
+            shift
+            local out_dir="${diag}/variants/${label}"
+            mkdir -p "${out_dir}"
+            if [ "$#" -eq 0 ]; then
+              cp "${selected_obj}" "${out_dir}/input.o"
+              echo '{"changes":[]}' > "${out_dir}/address-patch.json"
+              return 0
+            fi
+            python3 ../harness/.github/scripts/patch_macho_reloc_addresses.py \
+              --input "${selected_obj}" \
+              --output "${out_dir}/input.o" \
+              --out-json "${out_dir}/address-patch.json" \
+              "$@" \
+              2>&1 | tee "${out_dir}/address-patch.log"
+          }
+
+          relink_variant() {
+            local label="$1"
+            local out_dir="${diag}/variants/${label}"
+            local obj="${out_dir}/input.o"
+            local manual_bin_abs="$(pwd)/${out_dir}/nistkats.manual"
+            local manual_map="${out_dir}/nistkats.manual.map"
+            local manual_link_log="${out_dir}/link.log"
+            local args=(
+              -arch arm64
+              -nodefaultlibs
+              -o "${manual_bin_abs}"
+              "${obj}"
+              "${compiler_builtins}"
+              -L "$(pwd)/target/release/deps"
+              -L "${rustlib}"
+              -liconv
+              -lSystem
+              -lc
+              -lm
+              -Wl,-dead_strip
+              -Wl,-map,"${manual_map}"
+            )
+            {
+              printf 'DEVELOPER_DIR=%q xcrun cc' "${DEVELOPER_DIR}"
+              printf ' %q' "${args[@]}"
+              echo
+            } | tee "${out_dir}/command.log"
+            if DEVELOPER_DIR="${DEVELOPER_DIR}" xcrun cc "${args[@]}" > "${manual_link_log}" 2>&1; then
+              echo "manual_link_status=0" | tee "${out_dir}/meta.log"
+            else
+              status=$?
+              echo "manual_link_status=${status}" | tee "${out_dir}/meta.log"
+              return 0
+            fi
+            python3 ../harness/.github/scripts/scan_pr287_bad_word.py \
+              --root "${out_dir}" \
+              --bin "${manual_bin_abs}" \
+              --pattern-words "${pattern_words}" \
+              --bad-word 0x4e803241 \
+              --bad-index 8 \
+              --out "${out_dir}/scan.json" \
+              2>&1 | tee "${out_dir}/scan.log"
+          }
+
+          set_addr_arg() {
+            local idx="$1"
+            local addr="$2"
+            printf -- '--set=%s=0x%x' "${idx}" "${addr}"
+          }
+
+          make_address_variant original
+          make_address_variant pageoff_v_p400 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x400)))"
+          make_address_variant pageoff_v_p800 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x800)))"
+          make_address_variant pageoff_v_pc00_m4 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00 - 4)))"
+          make_address_variant pageoff_v_pc00_p4 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00 + 4)))"
+          make_address_variant pageoff_v_p1000 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1000)))"
+          make_address_variant pageoff_v_p1400 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1400)))"
+          make_address_variant page21_v_m210 "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x210)))"
+          make_address_variant page21_v_m300 "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))"
+          make_address_variant page21_v_m340 "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x340)))"
+          make_address_variant page21_v_m380 "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x380)))"
+
+          for variant_dir in "${diag}/variants"/*; do
+            relink_variant "$(basename "${variant_dir}")"
+          done
+
+          python3 - <<'PY' "${diag}/variants" "${diag}/address-sweep-summary.json" "${diag}/address-sweep-summary.md"
+import json
+import sys
+from pathlib import Path
+
+variants = Path(sys.argv[1])
+out_json = Path(sys.argv[2])
+out_md = Path(sys.argv[3])
+
+def load(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+def first_executable(scan):
+    entries = [
+        e for e in scan.get("interesting_files", [])
+        if "Mach-O 64-bit executable" in e.get("kind", "")
+    ]
+    return sorted(entries, key=lambda e: len(e.get("path", "")))[0] if entries else None
+
+rows = []
+for variant in sorted(p for p in variants.iterdir() if p.is_dir()):
+    patch = load(variant / "address-patch.json", {"changes": []})
+    scan = load(variant / "scan.json", {"interesting_files": []})
+    entry = first_executable(scan)
+    matches = entry.get("wildcard_context_matches", []) if entry else []
+    word = matches[0]["wildcard_word"] if matches else None
+    meta = ""
+    meta_path = variant / "meta.log"
+    if meta_path.exists():
+        for line in meta_path.read_text(errors="replace").splitlines():
+            if line.startswith("manual_link_status="):
+                meta = line.split("=", 1)[1]
+    changes = patch.get("changes", [])
+    rows.append({
+        "variant": variant.name,
+        "changes": changes,
+        "final_context_word": word,
+        "payload_bits_21_10": None if word is None else f"0x{((int(word,16) >> 10) & 0xfff):03x}",
+        "exact_bad_word_count": None if entry is None else entry.get("exact_bad_word_count"),
+        "wildcard_context_match_count": None if entry is None else entry.get("wildcard_context_match_count"),
+        "manual_link_status": meta,
+    })
+
+out_json.write_text(json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n")
+lines = [
+    "# PR287 relocation address sweep summary",
+    "",
+    "| Variant | Address changes | Final word | bits[21:10] | Exact bad count | Link status |",
+    "| --- | --- | --- | ---: | ---: | ---: |",
+]
+for row in rows:
+    changes = "; ".join(
+        f"rel[{c['relocation_index']}] {c['type_name']} {c['old_address']}->{c['new_address']}"
+        for c in row["changes"]
+    )
+    lines.append(
+        f"| {row['variant']} | `{changes}` | `{row['final_context_word']}` | "
+        f"`{row['payload_bits_21_10']}` | {row['exact_bad_word_count']} | {row['manual_link_status']} |"
+    )
+lines.append("")
+out_md.write_text("\n".join(lines))
+print(out_md.read_text())
+PY
+
+          {
+            echo "# PR287 relocation address sweep"
+            echo
+            echo "## selected pair"
+            cat "${diag}/selected-pair.log"
+            echo
+            echo "## address sweep"
+            cat "${diag}/address-sweep-summary.md"
+          } | tee "${diag}/summary.md"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-pr287-scalar-guard-reloc-address
+          path: |
+            libcrux/neon-rej-diagnostics/**/*.json
+            libcrux/neon-rej-diagnostics/**/*.log
+            libcrux/neon-rej-diagnostics/**/*.md
+            libcrux/neon-rej-diagnostics/**/*.txt
