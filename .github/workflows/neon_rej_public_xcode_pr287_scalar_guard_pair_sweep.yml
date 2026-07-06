@@ -124,6 +124,7 @@ jobs:
           test -f "${selected_obj}"
           cp "${selected_obj}" "${diag}/selected.o"
           nm -nm "${selected_obj}" | grep 'lCPI233_' | tee "${diag}/lcpi233-symbols.txt"
+          awk '/lCPI233_/ { print $NF }' "${diag}/lcpi233-symbols.txt" | tee "${diag}/lcpi233-targets.txt"
           rustlib="$(rustc +1.78.0 --print target-libdir)"
           compiler_builtins="$(ls "${rustlib}"/libcompiler_builtins-*.rlib | head -n 1)"
           test -f "${compiler_builtins}"
@@ -134,10 +135,6 @@ jobs:
             echo "rustlib=${rustlib}"
             echo "compiler_builtins=${compiler_builtins}"
           } | tee "${diag}/selected-object.log"
-
-          symbol_exists() {
-            nm -nm "${selected_obj}" | grep -Eq "[[:space:]]lCPI233_${1}$"
-          }
 
           make_original_variant() {
             local out_dir="${diag}/variants/original"
@@ -150,10 +147,6 @@ jobs:
             local idx="$1"
             local label="pair_to_lcpi233_${idx}"
             local out_dir="${diag}/variants/${label}"
-            if ! symbol_exists "${idx}"; then
-              echo "skip ${label}: missing symbol"
-              return 0
-            fi
             mkdir -p "${out_dir}"
             python3 ../harness/.github/scripts/retarget_macho_relocs.py \
               --input "${selected_obj}" \
@@ -210,9 +203,17 @@ jobs:
           }
 
           make_original_variant
-          for idx in $(seq 0 31); do
-            make_pair_variant "${idx}"
-          done
+          while IFS= read -r symbol; do
+            idx="${symbol#lCPI233_}"
+            case "${idx}" in
+              ""|*[!0-9]*)
+                continue
+                ;;
+            esac
+            if [ "${idx}" -le 31 ]; then
+              make_pair_variant "${idx}"
+            fi
+          done < "${diag}/lcpi233-targets.txt"
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
