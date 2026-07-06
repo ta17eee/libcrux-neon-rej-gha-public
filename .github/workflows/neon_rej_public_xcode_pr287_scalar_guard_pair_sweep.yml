@@ -239,4 +239,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: neon-rej-public-xcode-pr287-scalar-guard-pair-sweep
-          path: libcrux/neon-rej-diagnostics/**
+          path: |
+            libcrux/neon-rej-diagnostics/**/*.json
+            libcrux/neon-rej-diagnostics/**/*.log
+            libcrux/neon-rej-diagnostics/**/*.md
+            libcrux/neon-rej-diagnostics/**/*.txt
