@@ -245,6 +245,10 @@ jobs:
           }
 
           make_nvalue_variant pair_lcpi2_unpatched lCPI233_2 ""
+          make_nvalue_variant pair_lcpi2_value_lcpi5 lCPI233_2 "${value_5}"
+          make_nvalue_variant pair_lcpi2_value_lcpi8 lCPI233_2 "${value_8}"
+          make_nvalue_variant pair_lcpi2_value_lcpi23 lCPI233_2 "${value_23}"
+          make_nvalue_variant pair_lcpi2_value_lcpi31 lCPI233_2 "${value_31}"
           make_nvalue_variant pair_lcpi8_unpatched lCPI233_8 ""
           make_nvalue_variant pair_lcpi8_value_lcpi2 lCPI233_8 "${value_2}"
           make_nvalue_variant pair_lcpi8_value_lcpi5 lCPI233_8 "${value_5}"
