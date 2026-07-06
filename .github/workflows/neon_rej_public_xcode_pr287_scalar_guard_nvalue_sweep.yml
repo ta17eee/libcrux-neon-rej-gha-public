@@ -244,6 +244,15 @@ jobs:
               2>&1 | tee "${out_dir}/symbol-patch.log"
           }
 
+          make_lcpi2_delta_variant() {
+            local label="$1"
+            local delta="$2"
+            local base_value=$((value_2))
+            local patched_value
+            printf -v patched_value '0x%x' $((base_value + delta))
+            make_nvalue_variant "${label}" "${symbol_2}" "${patched_value}"
+          }
+
           relink_variant() {
             local label="$1"
             local out_dir="${diag}/variants/${label}"
@@ -317,6 +326,22 @@ jobs:
           make_metadata_variant pair_lcpi6_meta_lcpi2_keep_value "${symbol_6}" "${symbol_2}"
           make_metadata_variant pair_lcpi8_meta_lcpi2_keep_value "${symbol_8}" "${symbol_2}"
           make_metadata_variant pair_lcpi23_meta_lcpi2_keep_value "${symbol_23}" "${symbol_2}"
+          make_lcpi2_delta_variant pair_lcpi2_delta_m40 -64
+          make_lcpi2_delta_variant pair_lcpi2_delta_m30 -48
+          make_lcpi2_delta_variant pair_lcpi2_delta_m20 -32
+          make_lcpi2_delta_variant pair_lcpi2_delta_m18 -24
+          make_lcpi2_delta_variant pair_lcpi2_delta_m10 -16
+          make_lcpi2_delta_variant pair_lcpi2_delta_m08 -8
+          make_lcpi2_delta_variant pair_lcpi2_delta_p08 8
+          make_lcpi2_delta_variant pair_lcpi2_delta_p10 16
+          make_lcpi2_delta_variant pair_lcpi2_delta_p18 24
+          make_lcpi2_delta_variant pair_lcpi2_delta_p20 32
+          make_lcpi2_delta_variant pair_lcpi2_delta_p30 48
+          make_lcpi2_delta_variant pair_lcpi2_delta_p40 64
+          make_lcpi2_delta_variant pair_lcpi2_delta_p50 80
+          make_lcpi2_delta_variant pair_lcpi2_delta_p60 96
+          make_lcpi2_delta_variant pair_lcpi2_delta_p70 112
+          make_lcpi2_delta_variant pair_lcpi2_delta_p80 128
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
