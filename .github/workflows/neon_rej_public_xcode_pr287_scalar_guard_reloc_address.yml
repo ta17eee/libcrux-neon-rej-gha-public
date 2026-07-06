@@ -177,6 +177,25 @@ jobs:
             printf 'later_pageoff_addr_3=0x%x\n' "${later_pageoff_addr_3}"
           } | tee "${diag}/selected-extra-addresses.log"
 
+          pair_addresses="$(
+            python3 -c 'import json; d=json.load(open("'"${diag}/reloc-context.json"'")); victim=int(d["victim_section_addr"],16); orig21=int("'"${pair_page21_index}"'"); origoff=int("'"${pair_pageoff_index}"'"); pairs=[p for p in d["candidate_page21_pageoff_pairs"] if p["symbol"]=="'"${pair_symbol}"'" and p["matched_base_reg"] and not (p["page21_index"]==orig21 and p["pageoff_index"]==origoff)]; addr=lambda x:int(x,16); pairs.sort(key=lambda p: (abs(p["page21_delta"])+abs(p["pageoff_delta"]), abs(p["pageoff_delta"]))); vals=[]; [vals.extend([addr(p["page21_addr"]), addr(p["pageoff_addr"])]) for p in pairs[:3]]; print(" ".join(str(v) for v in vals))'
+          )"
+          set -- ${pair_addresses}
+          pair_move_page21_addr_1="$1"
+          pair_move_pageoff_addr_1="$2"
+          pair_move_page21_addr_2="$3"
+          pair_move_pageoff_addr_2="$4"
+          pair_move_page21_addr_3="$5"
+          pair_move_pageoff_addr_3="$6"
+          {
+            printf 'pair_move_page21_addr_1=0x%x\n' "${pair_move_page21_addr_1}"
+            printf 'pair_move_pageoff_addr_1=0x%x\n' "${pair_move_pageoff_addr_1}"
+            printf 'pair_move_page21_addr_2=0x%x\n' "${pair_move_page21_addr_2}"
+            printf 'pair_move_pageoff_addr_2=0x%x\n' "${pair_move_pageoff_addr_2}"
+            printf 'pair_move_page21_addr_3=0x%x\n' "${pair_move_page21_addr_3}"
+            printf 'pair_move_pageoff_addr_3=0x%x\n' "${pair_move_pageoff_addr_3}"
+          } | tee "${diag}/selected-pair-move-addresses.log"
+
           make_address_variant() {
             local label="$1"
             shift
@@ -262,6 +281,15 @@ jobs:
           make_address_variant pageoff_existing_later_1 "$(set_addr_arg "${pair_pageoff_index}" "${later_pageoff_addr_1}")"
           make_address_variant pageoff_existing_later_2 "$(set_addr_arg "${pair_pageoff_index}" "${later_pageoff_addr_2}")"
           make_address_variant pageoff_existing_later_3 "$(set_addr_arg "${pair_pageoff_index}" "${later_pageoff_addr_3}")"
+          make_address_variant pair_existing_move_1 \
+            "$(set_addr_arg "${pair_page21_index}" "${pair_move_page21_addr_1}")" \
+            "$(set_addr_arg "${pair_pageoff_index}" "${pair_move_pageoff_addr_1}")"
+          make_address_variant pair_existing_move_2 \
+            "$(set_addr_arg "${pair_page21_index}" "${pair_move_page21_addr_2}")" \
+            "$(set_addr_arg "${pair_pageoff_index}" "${pair_move_pageoff_addr_2}")"
+          make_address_variant pair_existing_move_3 \
+            "$(set_addr_arg "${pair_page21_index}" "${pair_move_page21_addr_3}")" \
+            "$(set_addr_arg "${pair_pageoff_index}" "${pair_move_pageoff_addr_3}")"
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
@@ -339,6 +367,9 @@ jobs:
             echo
             echo "## selected extra addresses"
             cat "${diag}/selected-extra-addresses.log"
+            echo
+            echo "## selected pair-move addresses"
+            cat "${diag}/selected-pair-move-addresses.log"
             echo
             echo "## address sweep"
             cat "${diag}/address-sweep-summary.md"
