@@ -1,0 +1,145 @@
+name: NEON rejection sampler public Xcode PR287 scalar guard object vs final
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/neon_rej_public_xcode_pr287_scalar_guard_object_vs_final.yml
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  pr287-scalar-guard-object-vs-final:
+    name: pr287 scalar-guard object-vs-final ordinary
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout probe repository
+        uses: actions/checkout@v4
+        with:
+          path: harness
+
+      - name: Checkout public upstream libcrux at PR287 fallback commit
+        uses: actions/checkout@v4
+        with:
+          repository: cryspen/libcrux
+          ref: 76ab582c79998d5ef77e6e6b6d287c6b1ff0106d
+          path: libcrux
+
+      - name: Assert Apple Silicon runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: ${arch}"
+          echo "RUNNER_ARCH: ${RUNNER_ARCH:-unset}"
+          test "${arch}" = "arm64"
+
+      - name: Patch old hax dependency pins
+        working-directory: libcrux
+        run: |
+          retry() {
+            local attempt status
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              status=$?
+              echo "attempt ${attempt} failed with status ${status}: $*"
+              sleep $((attempt * 10))
+            done
+            return "${status}"
+          }
+
+          find . -name Cargo.toml -print0 \
+            | xargs -0 perl -0pi -e 's/branch = "main"/rev = "3885c006197a86466f9928d4c619a435617ee0a8"/g if /github\.com\/hacspec\/hax/'
+          retry cargo update -p clap --precise 4.5.4
+          retry cargo update -p half --precise 2.4.1
+          retry cargo update -p rayon --precise 1.10.0
+          retry cargo update -p rayon-core --precise 1.12.1
+          retry cargo update -p quickcheck --precise 1.0.3
+          retry cargo update -p quickcheck_macros --precise 1.0.0
+
+      - name: Re-enable NEON rejection sampler with scalar guard
+        working-directory: libcrux
+        run: |
+          perl -0pi -e 's#// mod rejsample;#mod rejsample;#' polynomials-aarch64/src/lib.rs
+          perl -0pi -e 's#rej_sample\(a, out\)#rejsample::rej_sample(a, out)#' polynomials-aarch64/src/lib.rs
+          python3 ../harness/.github/scripts/patch_pr287_rejsample_scalar_guard.py
+          git diff -- polynomials-aarch64/src/lib.rs polynomials-aarch64/src/rejsample.rs
+
+      - name: Install historical toolchain
+        run: |
+          rustup toolchain install 1.78.0
+
+      - name: Build ML-KEM NIST KAT binary
+        working-directory: libcrux
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_15.0.1.app/Contents/Developer
+          RUSTFLAGS: -C save-temps -C debuginfo=2
+        run: |
+          set -o pipefail
+          mkdir -p neon-rej-diagnostics/pr287-scalar-guard-object-vs-final
+          {
+            echo "label=pr287 scalar-guard object-vs-final ordinary"
+            echo "target_feature_flags="
+            sw_vers
+            uname -a
+            xcodebuild -version
+            xcrun --find ld
+            xcrun --show-sdk-path
+            ld -v || true
+            rustc +1.78.0 --version
+            cargo +1.78.0 --version
+            lldb --version
+          } | tee neon-rej-diagnostics/pr287-scalar-guard-object-vs-final/toolchain.log
+          cargo +1.78.0 test \
+            --manifest-path libcrux-ml-kem/Cargo.toml \
+            --release \
+            --test nistkats \
+            --no-run \
+            2>&1 | tee neon-rej-diagnostics/pr287-scalar-guard-object-vs-final/build.log
+
+      - name: Capture crash state and compare object/final bytes
+        working-directory: libcrux
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_15.0.1.app/Contents/Developer
+          RUST_BACKTRACE: "1"
+        run: |
+          set -o pipefail
+          diag="neon-rej-diagnostics/pr287-scalar-guard-object-vs-final"
+          bin="$(pwd)/$(find target/release/deps -maxdepth 1 -type f -perm +111 -name 'nistkats-*' | head -n 1)"
+          test -x "${bin}"
+          echo "binary=${bin}" | tee "${diag}/lldb.log"
+          echo "process_cwd=$(pwd)/libcrux-ml-kem" | tee -a "${diag}/lldb.log"
+          {
+            echo "### final binary file"
+            file "${bin}" || true
+            echo "### final binary symbols"
+            nm -an "${bin}" | grep -E 'rej_sample|rejsample|ind_cpa|encrypt|shake128|keccak|veor' || true
+            echo "### lldb"
+            lldb --batch \
+              -o "settings set target.process.thread.step-avoid-regexp ^$" \
+              -k "thread list" \
+              -k "thread backtrace all" \
+              -k "register read" \
+              -k "disassemble --pc --count 40" \
+              -k 'image lookup --address `$pc`' \
+              -k 'memory read --format x --size 4 --count 16 `$pc-32`' \
+              -o "process launch --working-dir $(pwd)/libcrux-ml-kem -- --nocapture" \
+              "${bin}" || true
+          } 2>&1 | tee -a "${diag}/lldb.log"
+
+          python3 ../harness/.github/scripts/scan_pr287_bad_word.py \
+            --root target/release/deps \
+            --bin "${bin}" \
+            --lldb-log "${diag}/lldb.log" \
+            --out "${diag}/object-vs-final-scan.json" \
+            2>&1 | tee "${diag}/object-vs-final-scan.log"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-rej-public-xcode-pr287-scalar-guard-object-vs-final
+          path: libcrux/neon-rej-diagnostics/**
