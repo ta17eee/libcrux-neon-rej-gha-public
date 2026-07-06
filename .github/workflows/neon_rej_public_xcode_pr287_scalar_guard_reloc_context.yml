@@ -147,11 +147,6 @@ jobs:
             --window 0x5000 \
             2>&1 | tee "${diag}/reloc-context.log"
 
-          xcrun llvm-objdump --macho --arch=arm64 --reloc "${selected_obj}" \
-            > "${diag}/object/llvm-reloc.txt" 2>&1 || true
-          otool -r "${selected_obj}" > "${diag}/object/otool-reloc.txt" 2>&1 || true
-          nm -nm "${selected_obj}" > "${diag}/object/nm.txt" 2>&1 || true
-
           {
             echo "# PR287 relocation context summary"
             echo
