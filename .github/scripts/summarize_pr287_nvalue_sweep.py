@@ -56,6 +56,27 @@ def patched_value(patch):
     return ",".join(sorted(values))
 
 
+def metadata_delta(patch):
+    changes = patch.get("changes", [])
+    if not changes:
+        return ""
+    parts = []
+    for change in changes:
+        fields = change.get("fields", [])
+        if not fields:
+            continue
+        field_parts = []
+        for field in fields:
+            old_key = f"old_{field}"
+            new_key = f"new_{field}"
+            if old_key in change and new_key in change:
+                field_parts.append(f"{field}:{change[old_key]}->{change[new_key]}")
+        source = change.get("source_symbol_name", "")
+        suffix = f" from {source}" if source else ""
+        parts.append(",".join(field_parts) + suffix)
+    return "; ".join(part for part in parts if part)
+
+
 def summarize(root):
     rows = []
     for variant_dir in sorted(root.iterdir()):
@@ -78,6 +99,7 @@ def summarize(root):
             "retarget_original_value": retarget_value(retarget),
             "patched_value": patched_value(patch),
             "effective_value": patched_value(patch) or retarget_value(retarget),
+            "metadata_delta": metadata_delta(patch),
             "final_context_word": word,
             "payload_bits_21_10": None if word is None else f"0x{payload_bits(word):03x}",
             "exact_bad_word_count": None if entry is None else entry.get("exact_bad_word_count"),
@@ -96,13 +118,13 @@ def write_markdown(rows, path):
     lines = [
         "# PR287 n_value patch sweep summary",
         "",
-        "| Variant | Target | Original n_value | Patched n_value | Effective n_value | Final word | bits[21:10] | Exact bad count | Link status |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |",
+        "| Variant | Target | Original n_value | Patched n_value | Effective n_value | Metadata delta | Final word | bits[21:10] | Exact bad count | Link status |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
             "| {variant} | `{target_symbol}` | `{retarget_original_value}` | `{patched_value}` | "
-            "`{effective_value}` | `{final_context_word}` | `{payload_bits_21_10}` | "
+            "`{effective_value}` | `{metadata_delta}` | `{final_context_word}` | `{payload_bits_21_10}` | "
             "{exact_bad_word_count} | {manual_link_status} |".format(**row)
         )
     lines.append("")

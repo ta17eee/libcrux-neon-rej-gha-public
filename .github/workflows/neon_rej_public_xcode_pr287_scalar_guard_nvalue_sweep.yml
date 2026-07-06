@@ -9,6 +9,7 @@ on:
       - .github/workflows/neon_rej_public_xcode_pr287_scalar_guard_nvalue_sweep.yml
       - .github/scripts/retarget_macho_relocs.py
       - .github/scripts/patch_macho_symbol_values.py
+      - .github/scripts/patch_macho_symbol_metadata.py
       - .github/scripts/dump_pr287_reloc_context.py
       - .github/scripts/scan_pr287_bad_word.py
       - .github/scripts/summarize_pr287_nvalue_sweep.py
@@ -212,6 +213,29 @@ jobs:
             fi
           }
 
+          make_metadata_variant() {
+            local label="$1"
+            local target_symbol="$2"
+            local source_symbol="$3"
+            local fields="${4:-type,sect,desc}"
+            local out_dir="${diag}/variants/${label}"
+            mkdir -p "${out_dir}"
+            python3 ../harness/.github/scripts/retarget_macho_relocs.py \
+              --input "${selected_obj}" \
+              --output "${out_dir}/retargeted.o" \
+              --out-json "${out_dir}/retarget.json" \
+              --map "${pair_page21_index}=${target_symbol}" \
+              --map "${pair_pageoff_index}=${target_symbol}" \
+              2>&1 | tee "${out_dir}/retarget.log"
+            python3 ../harness/.github/scripts/patch_macho_symbol_metadata.py \
+              --input "${out_dir}/retargeted.o" \
+              --output "${out_dir}/input.o" \
+              --out-json "${out_dir}/symbol-patch.json" \
+              --copy "${target_symbol}=${source_symbol}" \
+              --fields "${fields}" \
+              2>&1 | tee "${out_dir}/symbol-patch.log"
+          }
+
           relink_variant() {
             local label="$1"
             local out_dir="${diag}/variants/${label}"
@@ -273,6 +297,12 @@ jobs:
           make_nvalue_variant pair_lcpi31_value_lcpi8 "${symbol_31}" "${value_8}"
           make_nvalue_variant pair_lcpi5_unpatched "${symbol_5}" ""
           make_nvalue_variant pair_lcpi5_value_lcpi8 "${symbol_5}" "${value_8}"
+          make_metadata_variant pair_lcpi2_meta_lcpi5_keep_value "${symbol_2}" "${symbol_5}"
+          make_metadata_variant pair_lcpi2_meta_lcpi8_keep_value "${symbol_2}" "${symbol_8}"
+          make_metadata_variant pair_lcpi2_meta_lcpi23_keep_value "${symbol_2}" "${symbol_23}"
+          make_metadata_variant pair_lcpi2_meta_lcpi31_keep_value "${symbol_2}" "${symbol_31}"
+          make_metadata_variant pair_lcpi8_meta_lcpi2_keep_value "${symbol_8}" "${symbol_2}"
+          make_metadata_variant pair_lcpi23_meta_lcpi2_keep_value "${symbol_23}" "${symbol_2}"
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
