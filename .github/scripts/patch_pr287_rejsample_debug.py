@@ -39,16 +39,16 @@ new = """    let masked0 = _vandq_u16(mask0, bits);
     if pick0 > 8 || pick1 > 8 || idx0 + 8 > out.len() {
         let mut input_low_lanes = [0i16; 8];
         let mut input_high_lanes = [0i16; 8];
-        let mut mask0_lanes = [0u16; 8];
-        let mut mask1_lanes = [0u16; 8];
-        let mut masked0_lanes = [0u16; 8];
-        let mut masked1_lanes = [0u16; 8];
+        let mut mask0_lanes = [0i16; 8];
+        let mut mask1_lanes = [0i16; 8];
+        let mut masked0_lanes = [0i16; 8];
+        let mut masked1_lanes = [0i16; 8];
         _vst1q_s16(&mut input_low_lanes, input.low);
         _vst1q_s16(&mut input_high_lanes, input.high);
-        _vst1q_u16(&mut mask0_lanes, mask0);
-        _vst1q_u16(&mut mask1_lanes, mask1);
-        _vst1q_u16(&mut masked0_lanes, masked0);
-        _vst1q_u16(&mut masked1_lanes, masked1);
+        _vst1q_s16(&mut mask0_lanes, _vreinterpretq_s16_u16(mask0));
+        _vst1q_s16(&mut mask1_lanes, _vreinterpretq_s16_u16(mask1));
+        _vst1q_s16(&mut masked0_lanes, _vreinterpretq_s16_u16(masked0));
+        _vst1q_s16(&mut masked1_lanes, _vreinterpretq_s16_u16(masked1));
         panic!(
             "NEON_REJ_DEBUG used0=0x{:04x} used0_u8=0x{:02x} used1=0x{:04x} used1_u8=0x{:02x} pick0={} pick1={} idx0={} out_len={} a={:?} input_low={:?} input_high={:?} mask0={:?} mask1={:?} masked0={:?} masked1={:?}",
             used0,
