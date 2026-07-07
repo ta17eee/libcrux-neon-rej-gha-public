@@ -296,15 +296,40 @@ jobs:
           make_address_variant pair_existing_move_3 \
             "$(set_addr_arg "${pair_page21_index}" "${pair_move_page21_addr_3}")" \
             "$(set_addr_arg "${pair_pageoff_index}" "${pair_move_pageoff_addr_3}")"
+          make_address_variant pair_word_v_m100_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x100)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x100)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m180_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x180)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x180)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m200_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x200)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x200)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
           make_address_variant pair_word_v_m210_pc00 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x210)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
             "$(set_word_arg $((victim_addr - 0x210)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m2fc_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x2fc)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x2fc)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
           make_address_variant pair_word_v_m300_pc00 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
             "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m304_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x304)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x304)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
           make_address_variant pair_word_v_m340_pc00 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x340)))" \
@@ -316,16 +341,56 @@ jobs:
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
             "$(set_word_arg $((victim_addr - 0x380)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m400_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x400)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x400)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m500_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x500)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x500)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m600_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x600)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x600)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_p400 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x400)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0x400)) 0x3dc00000)"
           make_address_variant pair_word_v_m300_p800 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x800)))" \
             "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0x800)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_pbfc \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xbfc)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xbfc)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_pc04 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc04)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc04)) 0x3dc00000)"
           make_address_variant pair_word_v_m300_p1000 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1000)))" \
             "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0x1000)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_p1400 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1400)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0x1400)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_p1800 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1800)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0x1800)) 0x3dc00000)"
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
