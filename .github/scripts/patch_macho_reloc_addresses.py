@@ -85,11 +85,19 @@ def parse_set(raw):
     return int(index, 0), int(address, 0)
 
 
+def parse_word(raw):
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError(f"word must be ADDRESS=WORD, got {raw!r}")
+    address, word = raw.split("=", 1)
+    return int(address, 0), int(word, 0)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--set", action="append", required=True, type=parse_set)
+    parser.add_argument("--word", action="append", default=[], type=parse_word)
     parser.add_argument("--section", default="__TEXT,__text")
     parser.add_argument("--out-json", type=Path)
     args = parser.parse_args()
@@ -133,6 +141,24 @@ def main():
             }
         )
 
+    word_changes = []
+    for address, new_word in args.word:
+        if address < 0 or address + 4 > sect["size"]:
+            raise SystemExit(f"word address 0x{address:x} outside section size 0x{sect['size']:x}")
+        if new_word < 0 or new_word > 0xFFFFFFFF:
+            raise SystemExit(f"word value out of range: 0x{new_word:x}")
+        word_off = sect["offset"] + address
+        old_word, = struct.unpack_from("<I", data, word_off)
+        struct.pack_into("<I", data, word_off, new_word)
+        word_changes.append(
+            {
+                "address": f"0x{address:x}",
+                "section_addr": f"0x{sect['addr'] + address:x}",
+                "old_word": f"0x{old_word:08x}",
+                "new_word": f"0x{new_word:08x}",
+            }
+        )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
     result = {
@@ -140,6 +166,7 @@ def main():
         "output": str(args.output),
         "section": args.section,
         "changes": changes,
+        "word_changes": word_changes,
     }
     if args.out_json:
         args.out_json.parent.mkdir(parents=True, exist_ok=True)

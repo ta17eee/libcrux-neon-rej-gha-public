@@ -264,6 +264,12 @@ jobs:
             printf -- '--set=%s=0x%x' "${idx}" "${addr}"
           }
 
+          set_word_arg() {
+            local addr="$1"
+            local word="$2"
+            printf -- '--word=0x%x=%s' "${addr}" "${word}"
+          }
+
           make_address_variant original
           make_address_variant pageoff_v_p400 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x400)))"
           make_address_variant pageoff_v_p800 "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x800)))"
@@ -290,6 +296,36 @@ jobs:
           make_address_variant pair_existing_move_3 \
             "$(set_addr_arg "${pair_page21_index}" "${pair_move_page21_addr_3}")" \
             "$(set_addr_arg "${pair_pageoff_index}" "${pair_move_pageoff_addr_3}")"
+          make_address_variant pair_word_v_m210_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x210)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x210)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m340_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x340)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x340)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m380_pc00 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x380)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+            "$(set_word_arg $((victim_addr - 0x380)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_p800 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x800)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0x800)) 0x3dc00000)"
+          make_address_variant pair_word_v_m300_p1000 \
+            "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x300)))" \
+            "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1000)))" \
+            "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
+            "$(set_word_arg $((victim_addr + 0x1000)) 0x3dc00000)"
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
@@ -331,6 +367,7 @@ jobs:
               rows.append({
                   "variant": variant.name,
                   "changes": changes,
+                  "word_changes": patch.get("word_changes", []),
                   "final_context_word": word,
                   "payload_bits_21_10": None if word is None else f"0x{((int(word,16) >> 10) & 0xfff):03x}",
                   "exact_bad_word_count": None if entry is None else entry.get("exact_bad_word_count"),
@@ -346,10 +383,16 @@ jobs:
               "| --- | --- | --- | ---: | ---: | ---: |",
           ]
           for row in rows:
+              word_changes = "; ".join(
+                  f"word {c['address']} {c['old_word']}->{c['new_word']}"
+                  for c in row["word_changes"]
+              )
               changes = "; ".join(
                   f"rel[{c['relocation_index']}] {c['type_name']} {c['old_address']}->{c['new_address']}"
                   for c in row["changes"]
               )
+              if word_changes:
+                  changes = f"{changes}; {word_changes}" if changes else word_changes
               lines.append(
                   f"| {row['variant']} | `{changes}` | `{row['final_context_word']}` | "
                   f"`{row['payload_bits_21_10']}` | {row['exact_bad_word_count']} | {row['manual_link_status']} |"
