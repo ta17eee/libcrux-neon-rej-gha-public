@@ -341,11 +341,27 @@ jobs:
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
             "$(set_word_arg $((victim_addr - 0x380)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          for page21_delta_hex in 384 388 38c 390 394 398 39c 3a0 3b0 3c0 3d0 3e0 3f0; do
+            page21_delta=$((16#${page21_delta_hex}))
+            make_address_variant "pair_word_v_m${page21_delta_hex}_pc00" \
+              "$(set_addr_arg "${pair_page21_index}" $((victim_addr - page21_delta)))" \
+              "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+              "$(set_word_arg $((victim_addr - page21_delta)) 0x90000000)" \
+              "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          done
           make_address_variant pair_word_v_m400_pc00 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x400)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
             "$(set_word_arg $((victim_addr - 0x400)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          for page21_delta_hex in 410 420 440 460 480; do
+            page21_delta=$((16#${page21_delta_hex}))
+            make_address_variant "pair_word_v_m${page21_delta_hex}_pc00" \
+              "$(set_addr_arg "${pair_page21_index}" $((victim_addr - page21_delta)))" \
+              "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
+              "$(set_word_arg $((victim_addr - page21_delta)) 0x90000000)" \
+              "$(set_word_arg $((victim_addr + 0xc00)) 0x3dc00000)"
+          done
           make_address_variant pair_word_v_m500_pc00 \
             "$(set_addr_arg "${pair_page21_index}" $((victim_addr - 0x500)))" \
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0xc00)))" \
