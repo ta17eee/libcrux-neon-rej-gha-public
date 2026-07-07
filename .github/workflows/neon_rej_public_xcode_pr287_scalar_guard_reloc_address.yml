@@ -407,6 +407,17 @@ jobs:
             "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + 0x1800)))" \
             "$(set_word_arg $((victim_addr - 0x300)) 0x90000000)" \
             "$(set_word_arg $((victim_addr + 0x1800)) 0x3dc00000)"
+          for combo in 3fc:400 3fc:1800 400:400 400:800 400:1800 404:400 404:800 404:1800 410:400; do
+            page21_delta_hex="${combo%%:*}"
+            pageoff_delta_hex="${combo##*:}"
+            page21_delta=$((16#${page21_delta_hex}))
+            pageoff_delta=$((16#${pageoff_delta_hex}))
+            make_address_variant "pair_word_v_m${page21_delta_hex}_p${pageoff_delta_hex}" \
+              "$(set_addr_arg "${pair_page21_index}" $((victim_addr - page21_delta)))" \
+              "$(set_addr_arg "${pair_pageoff_index}" $((victim_addr + pageoff_delta)))" \
+              "$(set_word_arg $((victim_addr - page21_delta)) 0x90000000)" \
+              "$(set_word_arg $((victim_addr + pageoff_delta)) 0x3dc00000)"
+          done
 
           for variant_dir in "${diag}/variants"/*; do
             relink_variant "$(basename "${variant_dir}")"
